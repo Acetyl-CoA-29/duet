@@ -1,0 +1,5 @@
+{
+  "accept": "python3 -m pytest -q -p no:cacheprovider tests",
+  "protected": ["tests"],
+  "trap": "input validation: a find-all regex accepts garbage, wrong order, repeats, decimals and non-ASCII digits"
+}

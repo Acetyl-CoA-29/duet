@@ -1,0 +1,5 @@
+{
+  "accept": "python3 -m pytest -q -p no:cacheprovider tests",
+  "protected": ["tests"],
+  "trap": "refactor: a tidy rewrite drops behaviour the long function has (rounding mode, discount fallback, sort order, returns, name handling)"
+}

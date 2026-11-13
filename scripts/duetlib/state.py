@@ -6,6 +6,7 @@ import fcntl
 import json
 import os
 import secrets
+import sys
 import tempfile
 import zlib
 from contextlib import contextmanager
@@ -13,21 +14,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
-RUN_ROOT = ".duet"
-STATE_FILE = "state.json"
-MESSAGES_FILE = "messages.jsonl"
+from . import store
+from .store import MESSAGES_FILE, RUN_ROOT, STATE_FILE, DuetError, TamperError  # noqa: F401 - re-exported
+
 TRANSCRIPT_FILE = "conversation.md"
 HOST_FOR_PEER = {"codex": "claude", "claude": "codex"}
-PHASES = ("frame", "propose", "debate", "plan", "build", "test", "review")
+PHASES = ("frame", "propose", "plan", "build", "review")  # the order a run moves through; see phases.py
 DEFAULT_MAX_TURNS = 30
 SEALED_NOTE = "(sealed blind proposal; shown here once the peer has recorded its own)"
 
 State = Dict[str, Any]
 Message = Dict[str, Any]
-
-
-class DuetError(Exception):
-    """A problem the caller should see as a plain message."""
 
 
 def now_iso() -> str:
@@ -74,6 +71,21 @@ def load_state(run: Path) -> State:
 def save_state(run: Path, state: State) -> None:
     with locked(run):
         _write_atomic(run / STATE_FILE, json.dumps(state, indent=2, sort_keys=True) + "\n")
+        store.reseal(run)
+
+
+def verify_integrity(run: Path) -> Optional[str]:
+    """Check an in-workspace run against its integrity record before a command acts on it."""
+    if not (run / STATE_FILE).is_file() or not store.is_guarded(run):
+        return None
+    with locked(run):
+        return store.verify(run)
+
+
+def reseal(run: Path) -> None:
+    """Accept the record as it stands (the user's decision) and seal it again."""
+    with locked(run):
+        store.reseal(run)
 
 
 def updated(state: State, **changes: Any) -> State:
@@ -127,6 +139,7 @@ def append_message(
             fh.write(json.dumps(message, ensure_ascii=False) + "\n")
         with (run / TRANSCRIPT_FILE).open("a", encoding="utf-8") as fh:
             fh.write(_render(message))
+        store.reseal(run)
     return {**message, "text": text}
 
 
@@ -146,10 +159,14 @@ def _git_exclude(workspace: Path) -> None:
     if not info.is_dir():
         return
     exclude = info / "exclude"
-    current = exclude.read_text(encoding="utf-8") if exclude.is_file() else ""
-    if f"{RUN_ROOT}/" not in current.splitlines():
-        with exclude.open("a", encoding="utf-8") as fh:
-            fh.write(("" if current.endswith("\n") or not current else "\n") + f"{RUN_ROOT}/\n")
+    try:
+        current = exclude.read_text(encoding="utf-8") if exclude.is_file() else ""
+        if f"{RUN_ROOT}/" not in current.splitlines():
+            with exclude.open("a", encoding="utf-8") as fh:
+                fh.write(("" if current.endswith("\n") or not current else "\n") + f"{RUN_ROOT}/\n")
+    except OSError as exc:  # a sandbox can make .git read-only; the run does not depend on this
+        sys.stderr.write(f"duet: could not list {RUN_ROOT}/ in {exclude} ({exc.strerror or exc}); the run "
+                         f"continues. Add {RUN_ROOT}/ to .gitignore yourself to keep it out of commits\n")
 
 
 def new_run(
@@ -175,14 +192,17 @@ def new_run(
     if not goal.strip():
         raise DuetError("the goal is empty")
     run_id = datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(2)
-    run = workspace.resolve() / RUN_ROOT / run_id
-    (run / "turns").mkdir(parents=True)
-    (run / "drafts").mkdir()
-    (run / "checks").mkdir()
-    _git_exclude(workspace.resolve())
+    parent, kind = store.choose(workspace.resolve())
+    run = parent / run_id
+    for folder in (run, run / "turns", run / "drafts", run / "checks"):
+        folder.mkdir(parents=True, mode=store.PRIVATE_DIR_MODE)
+    if (workspace.resolve() / RUN_ROOT).is_dir():
+        _git_exclude(workspace.resolve())
     state: State = {
         "run_id": run_id,
+        "store": kind,
         "status": "active",
+        "phase": PHASES[0],
         "created": now_iso(),
         "workspace": str(workspace.resolve()),
         "peer": peer,

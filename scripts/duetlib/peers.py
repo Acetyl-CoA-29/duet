@@ -19,7 +19,8 @@ BIN_ENV = {"codex": "DUET_CODEX_BIN", "claude": "DUET_CLAUDE_BIN"}
 OTHER_LAB_SECRETS = {"codex": ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"), "claude": ("OPENAI_API_KEY",)}
 COMMON_SECRETS = ("OPENROUTER_API_KEY", "GITHUB_TOKEN", "GH_TOKEN", "AWS_SECRET_ACCESS_KEY",
                   "AWS_SESSION_TOKEN", "NPM_TOKEN", "PYPI_TOKEN", "HF_TOKEN")
-CLAUDE_SANDBOX_SETTINGS = json.dumps({"sandbox": {"enabled": True, "autoAllowBashIfSandboxed": True}})
+CLAUDE_FOLDER = ".claude"
+CLAUDE_EDIT_TOOLS = ("Edit", "Write", "NotebookEdit")
 
 
 def host_is_sandboxed() -> bool:
@@ -66,18 +67,44 @@ def _codex_command(session: Optional[str], write: bool, model: Optional[str], ef
     return command + ["-"]
 
 
-def _claude_command(session: Optional[str], write: bool, model: Optional[str], user_config: bool) -> List[str]:
-    """Claude as peer: plan mode for read-only turns, edit mode for build turns, and its own
-    command sandbox in both so it can run tests without network or approval prompts."""
-    command = [
-        peer_binary("claude"), "-p", "--output-format", "json",
-        "--permission-mode", "acceptEdits" if write else "plan",
-    ]
-    if host_is_sandboxed():
-        # Claude's own sandbox cannot start inside the host's; the host's sandbox already confines commands.
-        command += ["--allowedTools", "Bash"]
+def claude_uses_plan_mode(write: bool) -> bool:
+    """Plan mode is the read-only guard only where Claude's own sandbox cannot run (inside a Codex sandbox)."""
+    return not write and host_is_sandboxed()
+
+
+def claude_settings(workspace: Path, write: bool, hidden: Optional[Path]) -> str:
+    """Per-turn settings for a Claude peer: its file tools may not read the run store, and, when its own
+    command sandbox can start, commands get no network, no route around the sandbox, no view of the run
+    store and, on a read-only turn, no write access to the workspace."""
+    settings: Dict[str, Any] = {}
+    if hidden is not None:
+        settings["permissions"] = {"deny": [f"Read(/{hidden}/**)", f"Edit(/{hidden}/**)"]}
+    if not host_is_sandboxed():
+        files: Dict[str, List[str]] = {}
+        if hidden is not None:
+            files["denyRead"] = [str(hidden)]
+        if not write:
+            files["denyWrite"] = [str(workspace.resolve())]
+        settings["sandbox"] = {"enabled": True, "autoAllowBashIfSandboxed": True,
+                               "allowUnsandboxedCommands": False, "filesystem": files}
+    return json.dumps(settings)
+
+
+def _claude_command(session: Optional[str], write: bool, model: Optional[str], user_config: bool,
+                    workspace: Path, hidden: Optional[Path]) -> List[str]:
+    """Claude as peer. Build turns: edit mode. Read-only turns: its edit tools are switched off and its
+    command sandbox denies writes to the workspace; inside a Codex sandbox, where Claude's own sandbox
+    cannot start, plan mode stands in and the host's sandbox confines commands."""
+    command = [peer_binary("claude"), "-p", "--output-format", "json"]
+    if write:
+        command += ["--permission-mode", "acceptEdits"]
+    elif claude_uses_plan_mode(write):
+        command += ["--permission-mode", "plan"]
     else:
-        command += ["--settings", CLAUDE_SANDBOX_SETTINGS]
+        command += ["--disallowedTools", *CLAUDE_EDIT_TOOLS]
+    if host_is_sandboxed():
+        command += ["--allowedTools", "Bash"]
+    command += ["--settings", claude_settings(workspace, write, hidden)]
     if not user_config:
         command.append("--safe-mode")
     if model:
@@ -140,6 +167,15 @@ def _parse_claude(output: str) -> PeerResult:
     return PeerResult(True, reply, data.get("session_id"), usage=usage)
 
 
+def _drop_empty_client_folder(workspace: Path) -> None:
+    """Claude's sandbox leaves an empty `.claude/.cc-writes` behind; remove it when nothing else is there."""
+    for folder in (workspace / CLAUDE_FOLDER / ".cc-writes", workspace / CLAUDE_FOLDER):
+        try:
+            folder.rmdir()
+        except OSError:
+            return
+
+
 def peer_env(peer: str) -> Dict[str, str]:
     """The peer's environment without the other lab's key or common deploy secrets."""
     keep = {name.strip() for name in os.environ.get("DUET_KEEP_ENV", "").split(",") if name.strip()}
@@ -158,13 +194,15 @@ def run_turn(
     timeout: int,
     effort: Optional[str] = None,
     user_config: bool = False,
+    hidden: Optional[Path] = None,
 ) -> PeerResult:
     """Send one message to the peer and wait for its reply. The prompt travels on stdin only."""
     turn_dir.mkdir(parents=True, exist_ok=True)
     last, out_path, err_path = turn_dir / "last.txt", turn_dir / "stdout.txt", turn_dir / "stderr.txt"
     (turn_dir / "prompt.md").write_text(prompt, encoding="utf-8")
-    command = _codex_command(session, write, model, effort, last) if peer == "codex" else _claude_command(session, write, model, user_config)
+    command = _codex_command(session, write, model, effort, last) if peer == "codex" else _claude_command(session, write, model, user_config, workspace, hidden)
     timed_out, code = False, None
+    had_client_folder = (workspace / CLAUDE_FOLDER).exists()
     try:
         with out_path.open("wb") as out, err_path.open("wb") as err:
             # Own process group, so a timeout stops the client and everything it started.
@@ -178,6 +216,8 @@ def run_turn(
                 stop_group(child, KILL_GRACE_SECONDS)
     except OSError as exc:
         return PeerResult(False, "", session, f"could not start {command[0]}: {exc}")
+    if peer == "claude" and not had_client_folder:
+        _drop_empty_client_folder(workspace)
     output = out_path.read_text(encoding="utf-8", errors="replace")
     parsed = _parse_codex(output, last) if peer == "codex" else _parse_claude(output)
     kept = parsed.session or session

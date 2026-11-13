@@ -10,7 +10,7 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from duetlib import cli, gates, state as st  # noqa: E402
+from duetlib import cli, gates, snapshot, state as st, store  # noqa: E402
 
 FAKE_CODEX = str(ROOT / "tests" / "fake_codex.py")
 FAKE_CLAUDE = str(ROOT / "tests" / "fake_claude.py")
@@ -25,7 +25,21 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("DUET_CODEX_BIN", FAKE_CODEX)
     monkeypatch.setenv("DUET_CLAUDE_BIN", FAKE_CLAUDE)
     monkeypatch.setenv("FAKE_LOG", str(log))
-    return {"ws": ws, "log": log, "tmp": tmp_path}
+    monkeypatch.setenv("DUET_HOME", str(tmp_path / "duet-home"))
+    monkeypatch.setenv("DUET_GUARD_DIR", str(tmp_path / "guard"))
+    monkeypatch.delenv("CODEX_SANDBOX", raising=False)
+    monkeypatch.delenv("CODEX_SANDBOX_NETWORK_DISABLED", raising=False)
+    assert tmp_path in store.duet_home().parents  # never the real ~/.local/state/duet
+    return {"ws": ws, "log": log, "tmp": tmp_path, "home": tmp_path / "duet-home"}
+
+
+@pytest.fixture
+def fallback(env, monkeypatch):
+    """The state directory cannot be written (as inside a Codex sandbox): runs go into the workspace."""
+    blocker = env["tmp"] / "not-a-directory"
+    blocker.write_text("x")
+    monkeypatch.setenv("DUET_HOME", str(blocker / "duet"))
+    return env
 
 
 def write(tmp: Path, name: str, text: str) -> str:
@@ -53,10 +67,14 @@ def calls(env):
     return [json.loads(line) for line in env["log"].read_text().splitlines()]
 
 
-def test_init_creates_run_inside_workspace(env, capsys):
+def test_init_creates_run_outside_the_workspace(env, capsys):
     run = start(env, capsys, "--accept", "true")
-    assert run.parent == env["ws"] / ".duet"
+    assert run.parent == env["home"] / "runs"
+    assert not (env["ws"] / ".duet").exists()
+    assert (env["home"] / "runs").stat().st_mode & 0o777 == 0o700 and run.stat().st_mode & 0o777 == 0o700
+    assert "weaker" not in capsys.readouterr().err
     state = st.load_state(run)
+    assert state["store"] == "home"
     assert state["peer"] == "codex" and state["host"] == "claude"
     assert state["accept_cmd"] == "true"
     assert "Build a tiny greeter." in (run / "conversation.md").read_text()
@@ -164,8 +182,15 @@ def test_check_records_result(env, capsys):
     assert last["speaker"] == "system" and last["meta"]["passed"] is True
 
 
+def enter_build(env, run):
+    """Review only follows build: record the host's build message unless the run is already there."""
+    if st.load_state(run).get("phase") not in ("build", "review"):
+        assert say(env, run, "Built it.", "--phase", "build") == 0
+
+
 def approve_both(env, run):
-    say(env, run, "I reviewed it.", "--phase", "review", "--verdict", "approve")
+    enter_build(env, run)
+    assert say(env, run, "I reviewed it.", "--phase", "review", "--verdict", "approve") == 0
     return cli.main(["peer", "--run", str(run), "--phase", "review"])
 
 
@@ -178,10 +203,11 @@ def test_finish_needs_passing_check(env, capsys):
 
 def test_finish_needs_both_approvals(env, capsys):
     run = start(env, capsys, "--accept", "true")
+    enter_build(env, run)
     cli.main(["check", "--run", str(run)])
-    say(env, run, "ok", "--phase", "review", "--verdict", "approve")
+    assert say(env, run, "ok", "--phase", "review", "--verdict", "approve") == 0
     assert cli.main(["finish", "--run", str(run)]) == cli.EXIT_NOT_DONE
-    assert "codex" in capsys.readouterr().out.lower()
+    assert "codex has not given a verdict" in capsys.readouterr().out.lower()
 
 
 def test_finish_succeeds_when_everything_holds(env, capsys):
@@ -203,8 +229,8 @@ def test_finish_rejects_changes_made_after_check_and_approval(env, capsys):
 
 def test_peer_cannot_approve_its_own_write_turn(env, capsys, monkeypatch):
     run = start(env, capsys, "--accept", "true")
-    say(env, run, "please build", "--phase", "review", "--verdict", "approve")
-    cli.main(["peer", "--run", str(run), "--phase", "build", "--write"])
+    assert say(env, run, "please build", "--phase", "build") == 0
+    assert cli.main(["peer", "--run", str(run), "--phase", "build", "--write"]) == 0
     last = st.read_messages(run)[-1]
     assert last["meta"]["verdict"] is None and last["meta"]["verdict_ignored"] == "approve"
     cli.main(["check", "--run", str(run)])
@@ -283,11 +309,18 @@ def test_claude_can_be_the_peer(env, capsys):
     assert cli.main(["peer", "--run", str(run), "--phase", "frame"]) == 0
     assert cli.main(["peer", "--run", str(run), "--phase", "build", "--write"]) == 0
     first, second = calls(env)
-    assert "-p" in first["argv"] and "plan" in first["argv"]
-    assert "--safe-mode" in first["argv"]
+    assert "-p" in first["argv"] and "--safe-mode" in first["argv"]
+    # Read-only turn: no plan mode; edit tools off and the command sandbox denies writes to the workspace.
+    assert "plan" not in first["argv"] and "Plan mode" not in first["stdin"]
+    denied = first["argv"][first["argv"].index("--disallowedTools") + 1:][:3]
+    assert denied == ["Edit", "Write", "NotebookEdit"]
     settings = json.loads(first["argv"][first["argv"].index("--settings") + 1])
-    assert settings["sandbox"]["enabled"] is True
-    assert "Plan mode" in first["stdin"] and "Plan mode" not in second["stdin"]
+    assert settings["sandbox"]["enabled"] is True and settings["sandbox"]["allowUnsandboxedCommands"] is False
+    assert settings["sandbox"]["filesystem"]["denyWrite"] == [str(env["ws"].resolve())]
+    assert settings["sandbox"]["filesystem"]["denyRead"] == [str(env["home"].resolve())]
+    assert f"Read(/{env['home'].resolve()}/**)" in settings["permissions"]["deny"]
+    build = json.loads(second["argv"][second["argv"].index("--settings") + 1])
+    assert "denyWrite" not in build["sandbox"]["filesystem"] and "--disallowedTools" not in second["argv"]
     assert "--resume" in second["argv"] and "claude-sess-9" in second["argv"]
     assert "acceptEdits" in second["argv"]
     assert st.read_messages(run)[-1]["speaker"] == "claude"
@@ -310,8 +343,10 @@ def test_status_reports_gate_state(env, capsys):
     assert report["blocking"]
 
 
-def test_fingerprint_ignores_run_folder_but_sees_source_edits(env, capsys):
+def test_fingerprint_ignores_run_folder_but_sees_source_edits(fallback, capsys):
+    env = fallback
     run = start(env, capsys, "--accept", "true")
+    assert run.parent == env["ws"] / ".duet"
     before = gates.fingerprint(env["ws"])
     (run / "scratch.txt").write_text("noise")
     assert gates.fingerprint(env["ws"]) == before
@@ -433,6 +468,7 @@ def test_claude_peer_can_load_user_config_when_asked(env, capsys):
 def test_file_change_in_read_only_turn_is_flagged_and_approval_dropped(env, capsys, monkeypatch):
     run = start(env, capsys, "--accept", "true")
     monkeypatch.setenv("FAKE_WRITE_FILE", str(env["ws"] / "sneaky.py"))
+    enter_build(env, run)
     assert cli.main(["peer", "--run", str(run), "--phase", "review"]) == cli.EXIT_READONLY_BROKEN
     msgs = st.read_messages(run)
     assert msgs[-1]["kind"] == "readonly_violation"
@@ -443,9 +479,12 @@ def test_claude_peer_under_codex_sandbox_uses_host_sandbox(env, capsys, monkeypa
     monkeypatch.setenv("CODEX_SANDBOX", "seatbelt")
     run = start(env, capsys, "--accept", "true", "--peer", "claude")
     assert cli.main(["peer", "--run", str(run), "--phase", "frame"]) == 0
-    argv = calls(env)[0]["argv"]
-    assert "--settings" not in argv
+    call = calls(env)[0]
+    argv = call["argv"]
+    settings = json.loads(argv[argv.index("--settings") + 1])
+    assert "sandbox" not in settings and settings["permissions"]["deny"]
     assert argv[argv.index("--allowedTools") + 1] == "Bash"
+    assert argv[argv.index("--permission-mode") + 1] == "plan" and "Plan mode" in call["stdin"]
 
 
 def test_claude_peer_refused_when_codex_sandbox_has_no_network(env, capsys, monkeypatch):
@@ -458,8 +497,13 @@ def test_claude_peer_refused_when_codex_sandbox_has_no_network(env, capsys, monk
     assert not (env["ws"] / ".duet").exists()
 
 
-def test_drafts_folder_is_outside_the_fingerprint(env, capsys):
+@pytest.mark.parametrize("mode", ["env", "fallback"])
+def test_drafts_and_goal_files_are_outside_the_fingerprint(mode, request, capsys):
+    env = request.getfixturevalue(mode)
+    (env["ws"] / ".duet").mkdir()
+    (env["ws"] / ".duet" / "goal.md").write_text("a goal kept in the workspace's .duet folder")
     run = start(env, capsys, "--accept", "true")
+    (env["ws"] / ".duet" / "notes.md").write_text("stray")
     before = gates.fingerprint(env["ws"])
     (run / "drafts" / "review.md").write_text("my review")
     assert gates.fingerprint(env["ws"]) == before
@@ -475,7 +519,7 @@ def test_approvals_outside_review_phase_do_not_finish(env, capsys):
 
 
 def test_debate_needs_both_proposals(env, capsys):
-    run = start(env, capsys, "--accept", "true")
+    run = start(env, capsys, "--accept", "true", proposals=True)
     say(env, run, "mine", "--phase", "propose")
     assert cli.main(["peer", "--run", str(run), "--phase", "debate"]) == cli.EXIT_BLIND
     assert calls(env) == []
@@ -552,13 +596,14 @@ def test_sealed_proposal_is_not_readable_on_disk_until_peer_proposes(env, capsys
     assert "HOST-SEALED-IDEA" in (run / "conversation.md").read_text()
 
 
-def test_sealed_proposal_stays_withheld_through_a_frame_turn(env, capsys):
+def test_sealed_proposal_stays_withheld_until_the_plan_phase(env, capsys):
     run = start(env, capsys, "--accept", "true", proposals=True)
+    assert cli.main(["peer", "--run", str(run), "--phase", "frame"]) == 0
     say(env, run, "HOST-SEALED-IDEA", "--phase", "propose")
-    cli.main(["peer", "--run", str(run), "--phase", "frame"])
-    cli.main(["peer", "--run", str(run), "--phase", "propose"])
-    assert all("HOST-SEALED-IDEA" not in call["stdin"] for call in calls(env))
-    cli.main(["peer", "--run", str(run), "--phase", "debate"])
+    assert cli.main(["peer", "--run", str(run), "--phase", "frame"]) == cli.EXIT_ORDER  # no way back to frame
+    assert cli.main(["peer", "--run", str(run), "--phase", "propose"]) == 0
+    assert len(calls(env)) == 2 and all("HOST-SEALED-IDEA" not in call["stdin"] for call in calls(env))
+    assert cli.main(["peer", "--run", str(run), "--phase", "plan"]) == 0
     assert "HOST-SEALED-IDEA" in calls(env)[-1]["stdin"]
 
 
@@ -569,6 +614,9 @@ def test_build_turn_and_finish_need_the_blind_round(env, capsys):
     assert cli.main(["finish", "--run", str(run)]) == cli.EXIT_NOT_DONE
     assert "blind proposal round" in capsys.readouterr().out
     assert both_propose(env, run) == 0
+    assert cli.main(["peer", "--run", str(run), "--phase", "build", "--write"]) == cli.EXIT_ORDER  # no plan yet
+    say(env, run, "Take the trie.", "--phase", "plan")
+    assert cli.main(["peer", "--run", str(run), "--phase", "plan"]) == 0
     assert cli.main(["peer", "--run", str(run), "--phase", "build", "--write"]) == 0
 
 
@@ -588,8 +636,9 @@ def test_author_does_not_need_to_approve_own_work(env, capsys, monkeypatch):
 def test_host_cannot_finish_on_its_own_edit_with_only_its_own_approval(env, capsys):
     run = start(env, capsys, "--accept", "true")
     (env["ws"] / "app.py").write_text("print('host edit')\n")
+    enter_build(env, run)
     cli.main(["check", "--run", str(run)])
-    say(env, run, "My change is good.", "--phase", "review", "--verdict", "approve")
+    assert say(env, run, "My change is good.", "--phase", "review", "--verdict", "approve") == 0
     assert st.load_state(run)["last_writer"] == "claude"
     assert cli.main(["finish", "--run", str(run)]) == cli.EXIT_NOT_DONE
     assert "codex has not given a verdict" in capsys.readouterr().out
@@ -645,7 +694,8 @@ def test_review_prompt_lists_changed_files_in_git_workspace(env, capsys):
     ws = _git_workspace(env)
     run = start(env, capsys, "--accept", "true")
     (ws / "app.py").write_text("print('edited')\n")
-    cli.main(["peer", "--run", str(run), "--phase", "review"])
+    enter_build(env, run)
+    assert cli.main(["peer", "--run", str(run), "--phase", "review"]) == 0
     assert " M app.py" in calls(env)[0]["stdin"]
 
 
@@ -708,7 +758,8 @@ def test_unexpected_fault_has_its_own_exit_code(env, capsys, monkeypatch):
     assert cli.main(["check", "--run", str(run)]) == cli.EXIT_INTERNAL
 
 
-def test_run_folder_is_added_to_git_exclude(env, capsys):
+def test_run_folder_is_added_to_git_exclude(fallback, capsys):
+    env = fallback
     ws = _git_workspace(env)
     start(env, capsys, "--accept", "true")
     start(env, capsys, "--accept", "true")
@@ -743,8 +794,10 @@ def test_read_only_violation_is_flagged_even_when_the_turn_fails(env, capsys, mo
     wrapper.write_text(f"#!/bin/sh\ncat > /dev/null\necho sneaky > {env['ws']}/sneaky.py\nexit 9\n")
     wrapper.chmod(0o755)
     monkeypatch.setenv("DUET_CODEX_BIN", str(wrapper))
+    enter_build(env, run)
     assert cli.main(["peer", "--run", str(run), "--phase", "review"]) == cli.EXIT_PEER_FAILED
     assert st.read_messages(run)[-1]["kind"] == "readonly_violation"
+    assert "No workspace file" not in st.read_messages(run)[-2]["text"]  # the next message tells that story
 
 
 def test_init_warns_when_api_key_may_override_plan_billing(env, capsys, monkeypatch):
@@ -752,3 +805,611 @@ def test_init_warns_when_api_key_may_override_plan_billing(env, capsys, monkeypa
     goal = write(env["tmp"], "goal.md", "x")
     assert cli.main(["init", "--workspace", str(env["ws"]), "--goal-file", goal, "--accept", "true"]) == 0
     assert "may bill that API key" in capsys.readouterr().err
+
+
+# --- run store location -------------------------------------------------------------------------
+
+def test_default_state_directory_is_under_the_home_folder(monkeypatch):
+    monkeypatch.delenv("DUET_HOME", raising=False)
+    assert store.duet_home() == Path("~/.local/state/duet").expanduser()
+
+
+def test_real_state_directory_is_untouched_by_a_run(env, capsys):
+    real = Path("~/.local/state/duet/runs").expanduser()
+    before = sorted(p.name for p in real.iterdir()) if real.is_dir() else None
+    run = start(env, capsys, "--accept", "true")
+    say(env, run, "hello", "--phase", "frame")
+    cli.main(["peer", "--run", str(run), "--phase", "frame"])
+    cli.main(["check", "--run", str(run)])
+    assert (sorted(p.name for p in real.iterdir()) if real.is_dir() else None) == before
+
+
+def test_unwritable_state_directory_falls_back_into_the_workspace_with_a_notice(fallback, capsys):
+    env = fallback
+    goal = write(env["tmp"], "goal.md", "Build a tiny greeter.")
+    assert cli.main(["init", "--workspace", str(env["ws"]), "--goal-file", goal, "--accept", "true"]) == 0
+    captured = capsys.readouterr()
+    run = Path(captured.out.strip())
+    assert run.parent == env["ws"].resolve() / ".duet"
+    notices = [line for line in captured.err.splitlines() if "weaker" in line]
+    assert len(notices) == 1 and "--add-dir" in notices[0]
+    assert st.load_state(run)["store"] == "workspace"
+    capsys.readouterr()
+    cli.main(["status", "--run", str(run)])
+    assert json.loads(capsys.readouterr().out)["store"] == "workspace"
+
+
+def test_goal_can_come_from_stdin(env, capsys, monkeypatch):
+    import io
+    monkeypatch.setattr(sys, "stdin", io.StringIO("Goal given on standard input."))
+    assert cli.main(["init", "--workspace", str(env["ws"]), "--accept", "true"]) == 0
+    run = Path(capsys.readouterr().out.strip())
+    assert st.read_messages(run)[0]["text"] == "Goal given on standard input."
+
+
+def test_goal_folder_in_workspace_is_git_excluded_even_when_the_run_is_outside(env, capsys):
+    ws = _git_workspace(env)
+    (ws / ".duet").mkdir()
+    (ws / ".duet" / "goal.md").write_text("goal")
+    before = gates.fingerprint(ws)
+    start(env, capsys, "--accept", "true")
+    assert ".duet/" in (ws / ".git" / "info" / "exclude").read_text().splitlines()
+    assert gates.fingerprint(ws) == before
+
+
+def test_sealed_proposal_stays_encoded_in_both_store_locations(fallback, capsys):
+    env = fallback
+    run = start(env, capsys, "--accept", "true", proposals=True)
+    say(env, run, "HOST-SEALED-IDEA use a trie", "--phase", "propose")
+    on_disk = "".join(p.read_text(errors="replace") for p in run.rglob("*") if p.is_file())
+    assert "HOST-SEALED-IDEA" not in on_disk
+
+
+def test_run_from_the_previous_layout_still_loads(env, capsys):
+    run = env["ws"] / ".duet" / "20250101-000000-abcd"
+    for name in ("turns", "drafts", "checks"):
+        (run / name).mkdir(parents=True)
+    old = {"run_id": run.name, "status": "active", "workspace": str(env["ws"]), "peer": "codex", "host": "claude",
+           "peer_model": None, "peer_session": None, "peer_cursor": 0, "withheld": [], "peer_turns": 0,
+           "max_turns": 30, "accept_cmd": "true", "accept_waived": None, "last_check": None,
+           "fail_streak": {"digest": None, "count": 0}}
+    (run / "state.json").write_text(json.dumps(old))
+    (run / "messages.jsonl").write_text(json.dumps(
+        {"seq": 1, "ts": "t", "speaker": "user", "phase": "frame", "kind": "goal", "text": "Old goal", "meta": {}}) + "\n")
+    (run / "conversation.md").write_text("# old\n")
+    assert cli.main(["status", "--run", str(run)]) == 0
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["store"] == "workspace" and "predates the integrity record" in captured.err
+    assert say(env, run, "carry on", "--phase", "frame") == 0
+    assert cli.main(["peer", "--run", str(run), "--phase", "frame"]) == 0
+    assert cli.main(["check", "--run", str(run)]) == 0
+    assert "predates" not in capsys.readouterr().err
+
+
+# --- integrity record for in-workspace runs -----------------------------------------------------
+
+def _forge(run: Path, **changes) -> None:
+    state = json.loads((run / "state.json").read_text())
+    (run / "state.json").write_text(json.dumps({**state, **changes}))
+
+
+def test_hand_edited_last_check_is_detected(fallback, capsys):
+    env = fallback
+    run = start(env, capsys, "--accept", "false")
+    assert cli.main(["check", "--run", str(run)]) == cli.EXIT_CHECK_FAILED
+    current = gates.fingerprint(env["ws"])
+    _forge(run, last_check={"seq": 2, "passed": True, "stable": True, "fingerprint": current})
+    capsys.readouterr()
+    for command in (["status"], ["finish"], ["peer", "--phase", "review"], ["check"]):
+        assert cli.main([command[0], "--run", str(run), *command[1:]]) == cli.EXIT_TAMPERED
+    assert "state.json changed outside the runner" in capsys.readouterr().err
+    assert calls(env) == []
+
+
+def test_hand_added_approval_is_detected(fallback, capsys):
+    env = fallback
+    run = start(env, capsys, "--accept", "true")
+    cli.main(["check", "--run", str(run)])
+    forged = {"seq": 3, "ts": "2026-01-01T00:00:00Z", "speaker": "claude", "phase": "review", "kind": "message",
+              "text": "fine", "meta": {"verdict": "approve", "fingerprint": gates.fingerprint(env["ws"])}}
+    with (run / "messages.jsonl").open("a") as fh:
+        fh.write(json.dumps(forged) + "\n")
+    assert cli.main(["finish", "--run", str(run)]) == cli.EXIT_TAMPERED
+    assert "messages.jsonl changed outside the runner" in capsys.readouterr().err
+    assert st.load_state(run)["status"] == "active"
+
+
+def test_deleted_integrity_record_is_refused_and_reseal_recovers(fallback, capsys):
+    env = fallback
+    run = start(env, capsys, "--accept", "true")
+    store.seal_path(run).unlink()
+    assert cli.main(["status", "--run", str(run)]) == cli.EXIT_TAMPERED
+    assert "integrity record for this run is missing" in capsys.readouterr().err
+    assert cli.main(["reseal", "--run", str(run), "--by-user", "I checked it, carry on"]) == 0
+    assert cli.main(["status", "--run", str(run)]) == 0
+    assert "I checked it, carry on" in st.read_messages(run)[-1]["text"]
+
+
+def test_integrity_record_is_kept_outside_the_workspace_and_follows_normal_use(fallback, capsys):
+    env = fallback
+    run = start(env, capsys, "--accept", "true")
+    assert env["ws"].resolve() not in store.seal_path(run).resolve().parents
+    say(env, run, "hello", "--phase", "frame")
+    assert cli.main(["peer", "--run", str(run), "--phase", "frame"]) == 0
+    assert cli.main(["check", "--run", str(run)]) == 0
+    assert approve_both(env, run) == 0
+    assert cli.main(["finish", "--run", str(run)]) == 0
+    store.seal_path(run).write_text("not json")
+    assert cli.main(["status", "--run", str(run)]) == cli.EXIT_TAMPERED
+
+
+def test_runs_in_the_state_directory_need_no_integrity_record(env, capsys):
+    run = start(env, capsys, "--accept", "true")
+    assert not store.seal_path(run).exists() and not store.is_guarded(run)
+    assert cli.main(["status", "--run", str(run)]) == 0
+
+
+# --- read-only turns are undone ------------------------------------------------------------------
+
+def _meddling_peer(env, monkeypatch, script: str, exit_code: int = 0) -> None:
+    """A stand-in peer that runs shell lines in the workspace, then answers like the Codex stand-in."""
+    wrapper = env["tmp"] / "meddling_peer.sh"
+    wrapper.write_text(f"#!/bin/sh\n{script}\n"
+                       + (f"cat > /dev/null\nexit {exit_code}\n" if exit_code else f'exec "{sys.executable}" "{FAKE_CODEX}" "$@"\n'))
+    wrapper.chmod(0o755)
+    monkeypatch.setenv("DUET_CODEX_BIN", str(wrapper))
+
+
+@pytest.mark.parametrize("git", [False, True])
+def test_read_only_turn_changes_are_undone_and_saved(env, capsys, monkeypatch, git):
+    ws = _git_workspace(env) if git else env["ws"]
+    (ws / "data.bin").write_bytes(bytes(range(256)))
+    (ws / "run.sh").write_text("echo run\n")
+    (ws / "run.sh").chmod(0o755)
+    (ws / "ignored.txt").write_text("local only\n")
+    if git:
+        import subprocess
+        subprocess.run(["git", "add", "-A"], cwd=str(ws), check=True)
+    run = start(env, capsys, "--accept", "true")
+    enter_build(env, run)
+    before = gates.manifest(ws)
+    _meddling_peer(env, monkeypatch, "echo appended >> app.py\nrm data.bin\nmkdir -p new/deep\n"
+                   "echo made > new/deep/created.py\necho changed > run.sh\nchmod 644 run.sh\n"
+                   "echo more >> ignored.txt\nmkdir -p __pycache__ && echo c > __pycache__/x.pyc")
+    assert cli.main(["peer", "--run", str(run), "--phase", "review"]) == cli.EXIT_READONLY_BROKEN
+    assert gates.manifest(ws) == before
+    assert (ws / "app.py").read_text() == "print('hi')\n" and (ws / "data.bin").read_bytes() == bytes(range(256))
+    assert not (ws / "new").exists() and (ws / "run.sh").stat().st_mode & 0o111
+    assert (ws / "__pycache__" / "x.pyc").exists()  # caches and ignored files are left alone
+    if git:
+        assert (ws / "ignored.txt").read_text() == "local only\nmore\n"
+    evidence = run / "turns" / "001" / "readonly-violation"
+    listing = (evidence / "changes.txt").read_text().splitlines()
+    assert {"modified app.py", "deleted data.bin", "created new/deep/created.py", "modified run.sh"} <= set(listing)
+    assert (evidence / "files" / "new" / "deep" / "created.py").read_text() == "made\n"
+    assert "+appended" in (evidence / "changes.patch").read_text()
+    assert not (run / "turns" / "001" / "snapshot").exists()
+    msgs = st.read_messages(run)
+    assert msgs[-1]["kind"] == "readonly_violation" and "put back" in msgs[-1]["text"]
+    assert "app.py" in msgs[-1]["text"] and str(evidence) in msgs[-1]["text"]
+    assert msgs[-2]["meta"]["verdict"] is None and msgs[-2]["meta"]["verdict_ignored"] == "approve"
+    state = st.load_state(run)
+    assert state["last_writer"] is None and state["seen_fingerprint"] == gates.fingerprint(ws)
+
+
+def test_read_only_change_is_undone_when_the_turn_fails(env, capsys, monkeypatch):
+    run = start(env, capsys, "--accept", "true")
+    _meddling_peer(env, monkeypatch, f"echo sneaky > {env['ws']}/sneaky.py", exit_code=9)
+    enter_build(env, run)
+    assert cli.main(["peer", "--run", str(run), "--phase", "review"]) == cli.EXIT_PEER_FAILED
+    assert not (env["ws"] / "sneaky.py").exists()
+    assert st.read_messages(run)[-1]["kind"] == "readonly_violation"
+
+
+def test_unchanged_read_only_turn_leaves_no_snapshot_behind(env, capsys):
+    run = start(env, capsys, "--accept", "true")
+    assert cli.main(["peer", "--run", str(run), "--phase", "frame"]) == 0
+    assert not (run / "turns" / "001" / "snapshot").exists()
+    assert not (run / "turns" / "001" / "readonly-violation").exists()
+
+
+def test_write_turn_takes_no_snapshot_and_keeps_the_change(env, capsys, monkeypatch):
+    run = start(env, capsys, "--accept", "true")
+    monkeypatch.setattr(snapshot, "take", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no snapshot")))
+    monkeypatch.setenv("FAKE_WRITE_FILE", str(env["ws"] / "feature.py"))
+    assert cli.main(["peer", "--run", str(run), "--phase", "build", "--write"]) == 0
+    assert (env["ws"] / "feature.py").exists()
+
+
+def test_workspace_over_the_snapshot_ceiling_is_only_detected(env, capsys, monkeypatch):
+    run = start(env, capsys, "--accept", "true")
+    (env["ws"] / "big.bin").write_bytes(b"x" * (2 * 1024 * 1024))
+    monkeypatch.setenv("DUET_SNAPSHOT_MAX_MB", "1")
+    monkeypatch.setenv("FAKE_WRITE_FILE", str(env["ws"] / "sneaky.py"))
+    enter_build(env, run)
+    capsys.readouterr()
+    assert cli.main(["peer", "--run", str(run), "--phase", "review"]) == cli.EXIT_READONLY_BROKEN
+    assert "snapshot ceiling" in capsys.readouterr().err
+    assert (env["ws"] / "sneaky.py").exists()
+    last = st.read_messages(run)[-1]
+    assert last["kind"] == "readonly_violation" and "still in place" in last["text"]
+    assert st.load_state(run)["last_writer"] == "codex"
+    assert (run / "turns" / "001" / "readonly-violation" / "changes.txt").read_text() == "created sneaky.py\n"
+
+
+def test_snapshot_falls_back_to_a_plain_copy_and_keeps_links(tmp_path, monkeypatch):
+    monkeypatch.setattr(snapshot, "_clonefile", lambda *a: False)
+    ws = tmp_path / "w"
+    ws.mkdir()
+    (ws / "a.txt").write_text("a")
+    (ws / "link").symlink_to("a.txt")
+    files = gates.manifest(ws)
+    assert snapshot.take(ws, files, tmp_path / "snap")
+    (ws / "link").unlink()
+    (ws / "link").write_text("now a file")
+    (ws / "a.txt").unlink()
+    (ws / "a.txt").mkdir()
+    (ws / "a.txt" / "inner").write_text("x")
+    after = gates.manifest(ws)
+    changed = gates.changed_files(files, after)
+    assert snapshot.restore(ws, tmp_path / "snap", changed, files) == []
+    assert gates.manifest(ws) == files and (ws / "link").is_symlink()
+
+
+def test_snapshot_ceiling_setting(monkeypatch):
+    monkeypatch.setenv("DUET_SNAPSHOT_MAX_MB", "nonsense")
+    assert snapshot.max_bytes() == snapshot.DEFAULT_MAX_MB * 1024 * 1024
+    monkeypatch.setenv("DUET_SNAPSHOT_MAX_MB", "0")
+    assert snapshot.max_bytes() == 0 and not snapshot.take(Path("."), {}, Path("/nonexistent/snap"))
+
+
+def test_claude_peer_cannot_read_the_in_workspace_store(fallback, capsys, monkeypatch):
+    env = fallback
+    run = start(env, capsys, "--accept", "true", "--peer", "claude")
+    assert cli.main(["peer", "--run", str(run), "--phase", "frame"]) == 0
+    argv = calls(env)[0]["argv"]
+    settings = json.loads(argv[argv.index("--settings") + 1])
+    assert settings["sandbox"]["filesystem"]["denyRead"] == [str(env["ws"].resolve() / ".duet")]
+
+
+def test_empty_claude_client_folder_is_removed_after_the_turn(env, capsys, monkeypatch):
+    wrapper = env["tmp"] / "claude_with_folder.sh"
+    wrapper.write_text(f'#!/bin/sh\nmkdir -p .claude/.cc-writes\nexec "{sys.executable}" "{FAKE_CLAUDE}" "$@"\n')
+    wrapper.chmod(0o755)
+    monkeypatch.setenv("DUET_CLAUDE_BIN", str(wrapper))
+    run = start(env, capsys, "--accept", "true", "--peer", "claude")
+    assert cli.main(["peer", "--run", str(run), "--phase", "frame"]) == 0
+    assert not (env["ws"] / ".claude").exists()
+    (env["ws"] / ".claude").mkdir()
+    (env["ws"] / ".claude" / "settings.json").write_text("{}")
+    assert cli.main(["peer", "--run", str(run), "--phase", "frame"]) == 0
+    assert (env["ws"] / ".claude" / "settings.json").exists()
+
+
+# --- phases are an enforced sequence -------------------------------------------------------------
+
+def status(run, capsys):
+    capsys.readouterr()
+    assert cli.main(["status", "--run", str(run)]) == 0
+    return json.loads(capsys.readouterr().out)
+
+
+def to_plan(env, run):
+    """Both blind proposals, then one plan message each: the shortest honest road to build."""
+    assert both_propose(env, run) == 0
+    assert say(env, run, "Their trie is better than my list; take it.", "--phase", "plan") == 0
+    assert cli.main(["peer", "--run", str(run), "--phase", "plan"]) == 0
+
+
+def test_new_run_starts_in_frame_and_status_lists_what_may_follow(env, capsys):
+    run = start(env, capsys, "--accept", "true", proposals=True)
+    assert st.load_state(run)["phase"] == "frame"
+    report = status(run, capsys)
+    assert report["phase"] == "frame" and report["allowed_next"] == ["frame", "propose"]
+    assert report["with_replan"] == []
+
+
+def test_full_sequence_moves_the_state_one_step_at_a_time(env, capsys):
+    run = start(env, capsys, "--accept", "true", proposals=True)
+    assert say(env, run, "What counts as done?", "--phase", "frame") == 0
+    assert both_propose(env, run) == 0
+    assert status(run, capsys)["phase"] == "propose"
+    assert say(env, run, "Take the trie.", "--phase", "plan") == 0
+    assert cli.main(["peer", "--run", str(run), "--phase", "plan"]) == 0
+    assert status(run, capsys)["allowed_next"] == ["plan", "build"]
+    assert cli.main(["peer", "--run", str(run), "--phase", "build", "--write"]) == 0
+    report = status(run, capsys)
+    assert report["phase"] == "build" and report["allowed_next"] == ["build", "review"]
+    assert report["with_replan"] == ["plan"]
+    assert say(env, run, "Read it.", "--phase", "review", "--verdict", "approve") == 0
+    assert status(run, capsys)["allowed_next"] == ["build", "review"]
+    assert say(env, run, "One more fix.", "--phase", "build") == 0  # review -> build is the iterate loop
+    assert st.load_state(run)["phase"] == "build"
+
+
+@pytest.mark.parametrize("phase", ["plan", "build", "review"])
+def test_host_cannot_skip_ahead_from_frame(env, capsys, phase):
+    run = start(env, capsys, "--accept", "true", proposals=True)
+    before = len(st.read_messages(run))
+    capsys.readouterr()
+    assert say(env, run, "skipping ahead", "--phase", phase) == cli.EXIT_ORDER == 6
+    assert "the run is in frame" in capsys.readouterr().err
+    assert len(st.read_messages(run)) == before and st.load_state(run)["phase"] == "frame"
+    assert cli.main(["peer", "--run", str(run), "--phase", phase]) == cli.EXIT_ORDER
+    assert calls(env) == []
+
+
+def test_host_cannot_plan_before_the_peer_has_proposed(env, capsys):
+    run = start(env, capsys, "--accept", "true", proposals=True)
+    say(env, run, "mine", "--phase", "propose")
+    assert say(env, run, "on to the plan", "--phase", "plan") == cli.EXIT_ORDER
+    assert "both blind proposals" in capsys.readouterr().err
+    assert st.load_state(run)["phase"] == "propose"
+
+
+def test_build_waits_until_both_have_spoken_in_plan(env, capsys):
+    run = start(env, capsys, "--accept", "true", proposals=True)
+    both_propose(env, run)
+    say(env, run, "Here is the joint plan.", "--phase", "plan")
+    assert say(env, run, "Building now.", "--phase", "build") == cli.EXIT_ORDER
+    assert cli.main(["peer", "--run", str(run), "--phase", "build", "--write"]) == cli.EXIT_ORDER
+    assert "both models have spoken in plan" in capsys.readouterr().err
+    assert cli.main(["peer", "--run", str(run), "--phase", "plan"]) == 0
+    assert say(env, run, "Building now.", "--phase", "build") == 0
+
+
+def test_review_only_follows_build(env, capsys):
+    run = start(env, capsys, "--accept", "true", proposals=True)
+    to_plan(env, run)
+    assert cli.main(["peer", "--run", str(run), "--phase", "review"]) == cli.EXIT_ORDER
+    assert "review follows build" in capsys.readouterr().err
+
+
+def test_no_going_back_to_frame_or_propose(env, capsys):
+    run = start(env, capsys, "--accept", "true", proposals=True)
+    to_plan(env, run)
+    for phase in ("frame", "propose"):
+        assert say(env, run, "again", "--phase", phase) == cli.EXIT_ORDER
+        assert cli.main(["peer", "--run", str(run), "--phase", phase]) == cli.EXIT_ORDER
+    assert f"cannot go back to propose" in capsys.readouterr().err
+
+
+def test_back_to_plan_needs_an_explicit_replan_and_a_fresh_plan_turn_each(env, capsys):
+    run = start(env, capsys, "--accept", "true", proposals=True)
+    to_plan(env, run)
+    say(env, run, "Built the trie.", "--phase", "build")
+    assert say(env, run, "The plan is wrong.", "--phase", "plan") == cli.EXIT_ORDER
+    assert "--replan" in capsys.readouterr().err
+    assert say(env, run, "The plan is wrong.", "--phase", "plan", "--replan", "the API has no prefix scan") == 0
+    msgs = st.read_messages(run)
+    assert msgs[-2]["kind"] == "replan" and "no prefix scan" in msgs[-2]["text"] and msgs[-1]["phase"] == "plan"
+    assert st.load_state(run)["phase"] == "plan"
+    assert say(env, run, "Building again.", "--phase", "build") == cli.EXIT_ORDER  # the peer has not replanned
+    assert cli.main(["peer", "--run", str(run), "--phase", "plan"]) == 0
+    assert "no prefix scan" in calls(env)[-1]["stdin"]
+    assert say(env, run, "Building again.", "--phase", "build") == 0
+
+
+def test_peer_turn_can_carry_the_replan_from_review(env, capsys, monkeypatch):
+    run = start(env, capsys, "--accept", "true", proposals=True)
+    to_plan(env, run)
+    say(env, run, "Built.", "--phase", "build")
+    assert cli.main(["peer", "--run", str(run), "--phase", "review"]) == 0
+    monkeypatch.setenv("FAKE_EXIT", "7")
+    assert cli.main(["peer", "--run", str(run), "--phase", "plan", "--replan", "review found a design flaw"]) == cli.EXIT_PEER_FAILED
+    assert st.load_state(run)["phase"] == "plan"  # the replan is the host's decision; it stands
+    monkeypatch.delenv("FAKE_EXIT")
+    assert cli.main(["peer", "--run", str(run), "--phase", "plan"]) == 0
+    assert [m["kind"] for m in st.read_messages(run)].count("replan") == 1
+
+
+def test_replan_is_refused_where_it_means_nothing(env, capsys):
+    run = start(env, capsys, "--accept", "true", proposals=True)
+    assert say(env, run, "x", "--phase", "frame", "--replan", "why") == cli.EXIT_USAGE
+    assert say(env, run, "x", "--phase", "frame", "--speaker", "user", "--replan", "why") == cli.EXIT_USAGE
+    assert cli.main(["peer", "--run", str(run), "--phase", "frame", "--replan", "why"]) == cli.EXIT_USAGE
+    enter_build(env, start(env, capsys, "--accept", "true"))
+    skipped = sorted((env["home"] / "runs").iterdir())[-1]
+    assert say(env, skipped, "x", "--phase", "plan", "--replan", " ") == cli.EXIT_USAGE  # a reason is required
+    assert calls(env) == []
+
+
+def test_debate_is_an_alias_for_plan(env, capsys):
+    run = start(env, capsys, "--accept", "true", proposals=True)
+    both_propose(env, run)
+    assert say(env, run, "My objection to yours.", "--phase", "debate") == 0
+    assert cli.main(["peer", "--run", str(run), "--phase", "debate"]) == 0
+    assert [m["phase"] for m in st.read_messages(run)[-2:]] == ["plan", "plan"]
+    prompt = calls(env)[-1]["stdin"]
+    assert "Phase: plan." in prompt and "strongest objection" in prompt and "ONE primary design" in prompt
+    assert "experiment" in prompt and "ordered tasks" in prompt and "VERDICT:" in prompt
+    assert say(env, run, "Building.", "--phase", "build") == 0
+
+
+def test_test_is_no_longer_a_phase(env, capsys):
+    run = start(env, capsys, "--accept", "true")
+    capsys.readouterr()
+    assert say(env, run, "ran the tests", "--phase", "test") == cli.EXIT_USAGE
+    assert "run `check`" in capsys.readouterr().err
+    assert cli.main(["peer", "--run", str(run), "--phase", "test"]) == cli.EXIT_USAGE
+    assert calls(env) == []
+    assert say(env, run, "x", "--phase", "ship-it") == cli.EXIT_USAGE
+    assert "unknown phase" in capsys.readouterr().err
+
+
+def test_write_turns_only_in_build(env, capsys):
+    run = start(env, capsys, "--accept", "true", proposals=True)
+    to_plan(env, run)
+    assert cli.main(["peer", "--run", str(run), "--phase", "plan", "--write"]) == cli.EXIT_ORDER
+    assert "--write" in capsys.readouterr().err
+    say(env, run, "Built.", "--phase", "build")
+    assert cli.main(["peer", "--run", str(run), "--phase", "review", "--write"]) == cli.EXIT_ORDER
+    assert all('sandbox_mode="read-only"' in call["argv"] for call in calls(env))
+
+
+def test_skip_proposals_goes_straight_to_build(env, capsys):
+    run = start(env, capsys, "--accept", "true")
+    assert status(run, capsys)["allowed_next"] == ["frame", "propose", "plan", "build"]
+    assert cli.main(["peer", "--run", str(run), "--phase", "build", "--write"]) == 0
+    assert st.load_state(run)["phase"] == "build"
+
+
+def test_user_can_speak_in_any_state_without_moving_it(env, capsys):
+    run = start(env, capsys, "--accept", "true", proposals=True)
+    assert say(env, run, "Mind the deadline.", "--speaker", "user") == 0
+    assert say(env, run, "And keep it small.", "--speaker", "user", "--phase", "review") == 0
+    assert [m["phase"] for m in st.read_messages(run)[-2:]] == ["frame", "frame"]
+    assert st.load_state(run)["phase"] == "frame"
+    to_plan(env, run)
+    assert say(env, run, "Go on.", "--speaker", "user", "--phase", "frame") == 0
+    assert st.read_messages(run)[-1]["phase"] == "plan" and st.load_state(run)["phase"] == "plan"
+    assert say(env, run, "no phase given") == cli.EXIT_USAGE  # the host must name its phase
+
+
+def test_failed_peer_turn_does_not_move_the_state(env, capsys, monkeypatch):
+    run = start(env, capsys, "--accept", "true", proposals=True)
+    to_plan(env, run)
+    monkeypatch.setenv("FAKE_EXIT", "7")
+    assert cli.main(["peer", "--run", str(run), "--phase", "build", "--write"]) == cli.EXIT_PEER_FAILED
+    assert st.load_state(run)["phase"] == "plan"
+    monkeypatch.delenv("FAKE_EXIT")
+    assert cli.main(["peer", "--run", str(run), "--phase", "build", "--write"]) == 0
+    assert st.load_state(run)["phase"] == "build"
+
+
+def test_new_session_replay_follows_the_same_rules(env, capsys):
+    run = start(env, capsys, "--accept", "true", proposals=True)
+    say(env, run, "HOST-SEALED-IDEA", "--phase", "propose")
+    assert cli.main(["peer", "--run", str(run), "--phase", "plan", "--new-session"]) == cli.EXIT_ORDER
+    assert cli.main(["peer", "--run", str(run), "--phase", "propose", "--new-session"]) == 0
+    assert "HOST-SEALED-IDEA" not in calls(env)[0]["stdin"]  # a replay does not break the blind round
+    say(env, run, "Plan.", "--phase", "plan")
+    assert cli.main(["peer", "--run", str(run), "--phase", "plan", "--new-session"]) == 0
+    assert "HOST-SEALED-IDEA" in calls(env)[1]["stdin"] and st.load_state(run)["phase"] == "plan"
+
+
+def test_check_and_experiment_are_free_in_any_state_and_carry_its_label(env, capsys):
+    run = start(env, capsys, "--accept", "true", proposals=True)
+    assert cli.main(["check", "--run", str(run)]) == 0
+    assert cli.main(["experiment", "--run", str(run), "--cmd", "true"]) == 0
+    assert [m["phase"] for m in st.read_messages(run)[-2:]] == ["frame", "frame"]
+    to_plan(env, run)
+    cli.main(["check", "--run", str(run)])
+    assert st.read_messages(run)[-1]["phase"] == "plan" and st.load_state(run)["phase"] == "plan"
+
+
+def test_host_cannot_speak_in_a_finished_run(env, capsys):
+    run = start(env, capsys, "--accept", "true")
+    cli.main(["check", "--run", str(run)])
+    approve_both(env, run)
+    assert cli.main(["finish", "--run", str(run)]) == 0
+    report = status(run, capsys)
+    assert report["phase"] == "done" and report["allowed_next"] == [] and report["with_replan"] == []
+    assert say(env, run, "one more thing", "--phase", "build") == cli.EXIT_USAGE
+
+
+def _legacy_run(env, labels):
+    """A run recorded before phases were tracked: no phase key, and the seven old labels."""
+    run = env["home"] / "runs" / "20250101-000000-abcd"
+    for name in ("turns", "drafts", "checks"):
+        (run / name).mkdir(parents=True)
+    old = {"run_id": run.name, "store": "home", "status": "active", "workspace": str(env["ws"]), "peer": "codex",
+           "host": "claude", "peer_model": None, "peer_session": None, "peer_cursor": 0, "withheld": [],
+           "peer_turns": 0, "max_turns": 30, "accept_cmd": "true", "accept_waived": None, "last_check": None,
+           "fail_streak": {"digest": None, "count": 0}}
+    (run / "state.json").write_text(json.dumps(old))
+    rows = [{"seq": 1, "ts": "t", "speaker": "user", "phase": "frame", "kind": "goal", "text": "Old goal", "meta": {}}]
+    for speaker, phase, kind in labels:
+        rows.append({"seq": len(rows) + 1, "ts": "t", "speaker": speaker, "phase": phase, "kind": kind,
+                     "text": f"{speaker} in {phase}", "meta": {}})
+    (run / "messages.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
+    (run / "conversation.md").write_text("# old\n")
+    return run
+
+
+@pytest.mark.parametrize("labels,expected,then_ok,then_refused", [
+    ([], "frame", "propose", "plan"),
+    ([("claude", "propose", "message"), ("codex", "propose", "message"), ("claude", "debate", "message"),
+      ("codex", "debate", "message")], "plan", "build", "review"),
+    ([("claude", "propose", "message"), ("codex", "propose", "message"), ("claude", "build", "message"),
+      ("system", "test", "check"), ("claude", "test", "message")], "build", "review", "propose"),
+    ([("claude", "build", "message"), ("codex", "review", "message"), ("system", "frame", "extend"),
+      ("user", "frame", "message")], "review", "build", "frame"),
+])
+def test_runs_recorded_before_phase_tracking_infer_their_state(env, capsys, labels, expected, then_ok, then_refused):
+    run = _legacy_run(env, labels)
+    assert status(run, capsys)["phase"] == expected
+    assert say(env, run, "not allowed", "--phase", then_refused) == cli.EXIT_ORDER
+    assert say(env, run, "carry on", "--phase", then_ok) == 0
+    assert st.load_state(run)["phase"] == then_ok
+
+
+def test_old_run_that_built_without_proposals_still_gets_no_write_turn(env, capsys):
+    run = _legacy_run(env, [("claude", "build", "message")])
+    assert cli.main(["peer", "--run", str(run), "--phase", "build", "--write"]) == cli.EXIT_BLIND
+    assert "blind proposal round" in capsys.readouterr().err and calls(env) == []
+
+
+# --- fixes from live use ---------------------------------------------------------------------------
+
+def test_init_survives_a_read_only_git_folder(fallback, capsys):
+    env = fallback
+    ws = _git_workspace(env)
+    info = ws / ".git" / "info"
+    (info / "exclude").write_text("# local\n")
+    (info / "exclude").chmod(0o400)
+    info.chmod(0o500)
+    try:
+        goal = write(env["tmp"], "goal.md", "Build a tiny greeter.")
+        assert cli.main(["init", "--workspace", str(ws), "--goal-file", goal, "--accept", "true"]) == 0
+        captured = capsys.readouterr()
+    finally:
+        info.chmod(0o700)
+        (info / "exclude").chmod(0o600)
+    assert Path(captured.out.strip()).is_dir()
+    notices = [line for line in captured.err.splitlines() if "info/exclude" in line]
+    assert len(notices) == 1 and ".gitignore" in notices[0]
+    assert (info / "exclude").read_text() == "# local\n"
+
+
+def test_finish_says_who_wrote_and_who_approved(env, capsys, monkeypatch):
+    run = start(env, capsys, "--accept", "true")
+    monkeypatch.setenv("FAKE_WRITE_FILE", str(env["ws"] / "feature.py"))
+    cli.main(["peer", "--run", str(run), "--phase", "build", "--write"])
+    monkeypatch.delenv("FAKE_WRITE_FILE")
+    cli.main(["check", "--run", str(run)])
+    say(env, run, "Read feature.py; fine.", "--phase", "review", "--verdict", "approve")
+    capsys.readouterr()
+    assert cli.main(["finish", "--run", str(run)]) == 0
+    printed = capsys.readouterr().out
+    recorded = st.read_messages(run)[-1]["text"]
+    for text in (printed, recorded):
+        assert "codex wrote the final change" in text and "claude approved" in text
+        assert "both models approved" not in text
+
+
+def test_finish_with_no_change_says_both_approved(env, capsys):
+    run = start(env, capsys, "--waive-accept", "prose only")
+    approve_both(env, run)
+    assert cli.main(["finish", "--run", str(run)]) == 0
+    text = st.read_messages(run)[-1]["text"]
+    assert "no file was changed" in text and "claude and codex approved" in text
+
+
+def test_failed_write_turn_reports_files_it_left_changed(env, capsys, monkeypatch):
+    run = start(env, capsys, "--accept", "true")
+    _meddling_peer(env, monkeypatch, f"echo done > {env['ws']}/feature.py", exit_code=9)
+    capsys.readouterr()
+    assert cli.main(["peer", "--run", str(run), "--phase", "build", "--write"]) == cli.EXIT_PEER_FAILED
+    error = st.read_messages(run)[-1]
+    assert error["kind"] == "peer_error" and "feature.py" in error["text"] and "`check`" in error["text"]
+    assert "feature.py" in capsys.readouterr().err
+    assert st.load_state(run)["last_writer"] == "codex"
+
+
+def test_failed_turn_that_touched_nothing_says_so(env, capsys, monkeypatch):
+    run = start(env, capsys, "--accept", "true")
+    monkeypatch.setenv("FAKE_EXIT", "7")
+    assert cli.main(["peer", "--run", str(run), "--phase", "build", "--write"]) == cli.EXIT_PEER_FAILED
+    assert "No workspace file changed" in st.read_messages(run)[-1]["text"]
+    assert "`check`" not in st.read_messages(run)[-1]["text"]

@@ -1,0 +1,5 @@
+{
+  "accept": "python3 -m pytest -q -p no:cacheprovider tests",
+  "protected": ["tests"],
+  "trap": "spec subtlety: which participant gets the leftover cents, ties, refunds, exact arithmetic on large totals"
+}

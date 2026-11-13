@@ -1,0 +1,5 @@
+{
+  "accept": "python3 -m pytest -q -p no:cacheprovider tests",
+  "protected": ["tests"],
+  "trap": "debugging: the failing visible test points at one seeded defect; the class breaks its documented contract in several other places"
+}
