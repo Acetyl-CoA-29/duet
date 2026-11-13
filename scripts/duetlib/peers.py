@@ -10,6 +10,21 @@ from typing import List, Optional
 
 DEFAULT_TIMEOUT_SECONDS = 2400
 ERROR_TAIL_CHARS = 1500
+CLAUDE_SANDBOX_SETTINGS = json.dumps({"sandbox": {"enabled": True, "autoAllowBashIfSandboxed": True}})
+
+
+def host_is_sandboxed() -> bool:
+    """True when this process was started by a Codex host inside its command sandbox."""
+    return bool(os.environ.get("CODEX_SANDBOX"))
+
+
+def launch_problem(peer: str) -> Optional[str]:
+    """Explain up front why the peer cannot be reached from here, if that is the case."""
+    if peer == "claude" and os.environ.get("CODEX_SANDBOX_NETWORK_DISABLED") == "1":
+        return ("the Codex sandbox this command runs in has no network access, so the Claude client cannot "
+                "be reached. Start Codex with network access and a writable ~/.claude, for example: "
+                "codex -c 'sandbox_workspace_write.network_access=true' --add-dir ~/.claude")
+    return None
 
 
 @dataclass(frozen=True)
@@ -35,11 +50,20 @@ def _codex_command(session: Optional[str], write: bool, model: Optional[str], ef
     return command + ["-"]
 
 
-def _claude_command(session: Optional[str], write: bool, model: Optional[str]) -> List[str]:
+def _claude_command(session: Optional[str], write: bool, model: Optional[str], user_config: bool) -> List[str]:
+    """Claude as peer: plan mode for read-only turns, edit mode for build turns, and its own
+    command sandbox in both so it can run tests without network or approval prompts."""
     command = [
         os.environ.get("DUET_CLAUDE_BIN", "claude"), "-p", "--output-format", "json",
         "--permission-mode", "acceptEdits" if write else "plan",
     ]
+    if host_is_sandboxed():
+        # Claude's own sandbox cannot start inside the host's; the host's sandbox already confines commands.
+        command += ["--allowedTools", "Bash"]
+    else:
+        command += ["--settings", CLAUDE_SANDBOX_SETTINGS]
+    if not user_config:
+        command.append("--safe-mode")
     if model:
         command += ["--model", model]
     if session:
@@ -94,12 +118,13 @@ def run_turn(
     model: Optional[str],
     timeout: int,
     effort: Optional[str] = None,
+    user_config: bool = False,
 ) -> PeerResult:
     """Send one message to the peer and wait for its reply. The prompt travels on stdin only."""
     turn_dir.mkdir(parents=True, exist_ok=True)
     last, out_path, err_path = turn_dir / "last.txt", turn_dir / "stdout.txt", turn_dir / "stderr.txt"
     (turn_dir / "prompt.md").write_text(prompt, encoding="utf-8")
-    command = _codex_command(session, write, model, effort, last) if peer == "codex" else _claude_command(session, write, model)
+    command = _codex_command(session, write, model, effort, last) if peer == "codex" else _claude_command(session, write, model, user_config)
     timed_out, code = False, None
     try:
         with out_path.open("wb") as out, err_path.open("wb") as err:

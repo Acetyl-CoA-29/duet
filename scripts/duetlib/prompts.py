@@ -59,6 +59,11 @@ WRITE_NOTE = (
     "change, run what you can to check it, then report exactly what you changed and what you ran."
 )
 READ_NOTE = "You have read-only access for this turn. Do not attempt to edit files."
+CLAUDE_READ_NOTE = (
+    " Plan mode is switched on only as that read-only guard: do not write a plan file, do not ask "
+    "to leave plan mode and do not mention it; reply with your message for this phase. You may "
+    "run commands that only read or test."
+)
 
 
 def acceptance_line(state: State) -> str:
@@ -87,5 +92,6 @@ def build_prompt(state: State, goal: str, phase: str, delta: List[Message], writ
         parts.append(f"Acceptance: {acceptance_line(state)}")
     parts.append("New in the conversation since your last turn:\n\n" + render_messages(delta))
     parts.append(PHASE_NOTES[phase])
-    parts.append(WRITE_NOTE if write else READ_NOTE)
+    read_note = READ_NOTE + (CLAUDE_READ_NOTE if state["peer"] == "claude" else "")
+    parts.append(WRITE_NOTE if write else read_note)
     return "\n\n".join(parts) + "\n"

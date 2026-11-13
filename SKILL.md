@@ -1,7 +1,7 @@
 ---
 name: duet
 description: "Two top models, one conversation, one build: you (the host model) and a peer model from the other lab (Codex for a Claude host, Claude for a Codex host) frame a goal, write blind independent proposals, argue to a joint plan, then build, test and iterate together until an agreed acceptance command passes and both approve. Use when asked to run a duet, to have Claude and Codex or GPT work or build together, to pair or debate with the other model, or for a two-model build loop. Not for a one-shot second opinion."
-version: 1.0.0
+version: 1.1.0
 ---
 
 # Duet
@@ -22,19 +22,35 @@ and tell the user; do not continue alone and call it a duet.
 1. Tell the user which two models are taking part, that peer turns use their Codex or Claude
    plan, and that the peer will get write access to the workspace during build turns. If they
    named a budget, pass it as `--max-turns`.
-2. Write the goal to a file in the user's words plus only the context it needs. No credentials,
-   no unrelated chat history: everything in the conversation is sent to the other lab's model.
-3. Pick the workspace (the project directory). The run is stored in `<workspace>/.duet/<run-id>/`.
+2. Pick the workspace (the project directory). The run is stored in `<workspace>/.duet/<run-id>/`.
+3. Write the goal to `<workspace>/.duet/goal.md` (create `.duet/` if needed) in the user's words
+   plus only the context it needs. No credentials, no unrelated chat history: everything in the
+   conversation is sent to the other lab's model.
 
 ```
 D init --workspace <dir> --goal-file <goal.md> --accept "<command that exits 0 when done>"
 ```
 
-It prints the run folder; pass it as `--run` to every later command. Use `--peer claude` when
-you are Codex. If no command can prove the goal (pure prose work), use
+It prints the run folder; pass it as `--run` to every later command. **Write every message file
+into `<run>/drafts/`**, never elsewhere in the workspace: the finish gate compares the workspace
+files, and a stray message file there counts as a change. Use `--peer claude` when you are Codex. If no command can prove the goal (pure prose work), use
 `--waive-accept "<reason>"` instead of `--accept`, and say so in the final report. If the
 acceptance command is not known yet, start with a placeholder such as `false` and replace it in
 the frame phase with `D accept --run <run> --cmd "<command>"`.
+
+## When you are Codex (Claude is the peer)
+
+- Pass `--peer claude` to `init`. Everything else is the same.
+- The Claude client needs the network and its own folder. If `peer` reports that the sandbox has
+  no network access, stop and give the user that message: Codex must be started with
+  `-c 'sandbox_workspace_write.network_access=true' --add-dir ~/.claude` (or the user approves
+  running the `peer` command outside the sandbox). Do not try other ways around the sandbox.
+- Claude joins as a clean session without the user's personal Claude setup (hooks, instructions,
+  plugins), so it acts only as a participant. `--peer-user-config` on `init` loads that setup
+  instead; it is slower and costs more per turn.
+- Read-only turns put Claude in plan mode. Its edit tools are blocked, but shell commands are
+  not write-proof, so the runner compares the files before and after: `peer` exits 8 if they
+  changed, and any approval from that turn is dropped. Inspect the change, then carry on.
 
 ## The loop
 
@@ -87,8 +103,8 @@ what is still blocking.
   user's call whichever model suggested it.
 - When the user says something mid-run, record it with `--speaker user` so the peer hears it too.
 
-Other exit codes: 1 check failed, 2 usage or bad run folder, 6 blind round out of order,
-7 finish refused.
+Other exit codes: 1 check failed, 2 usage, bad run folder or peer unreachable from this sandbox,
+6 blind round out of order, 7 finish refused, 8 files changed during a read-only peer turn.
 
 ## Before you report
 

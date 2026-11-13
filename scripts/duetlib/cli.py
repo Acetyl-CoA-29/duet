@@ -18,6 +18,7 @@ EXIT_STALLED = 4
 EXIT_PEER_FAILED = 5
 EXIT_BLIND = 6
 EXIT_NOT_DONE = 7
+EXIT_READONLY_BROKEN = 8
 
 
 def emit(text: str) -> None:
@@ -48,6 +49,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     run = st.new_run(
         Path(args.workspace), _read_text(args.goal_file), args.peer,
         args.accept, args.waive_accept, args.max_turns, args.peer_model, args.peer_effort,
+        args.peer_user_config,
     )
     emit(str(run))
     return EXIT_OK
@@ -104,6 +106,9 @@ def cmd_peer(args: argparse.Namespace) -> int:
     run = Path(args.run)
     state = st.load_state(run)
     messages = st.read_messages(run)
+    problem = peers.launch_problem(state["peer"])
+    if problem:
+        raise st.DuetError(problem)
     blocker = _peer_blocker(state, messages, args.phase)
     if blocker:
         warn(blocker[1])
@@ -111,10 +116,13 @@ def cmd_peer(args: argparse.Namespace) -> int:
     delta, held = _delta(state, messages, args.phase)
     first = state["peer_session"] is None
     prompt = prompts.build_prompt(state, _goal(messages), args.phase, delta, args.write, first)
+    workspace = Path(state["workspace"])
+    before = None if args.write else gates.fingerprint(workspace)
     attempt = len(list((run / "turns").iterdir())) + 1
     result = peers.run_turn(
         state["peer"], prompt, Path(state["workspace"]), run / "turns" / f"{attempt:03d}",
         state["peer_session"], args.write, state["peer_model"], args.timeout, state.get("peer_effort"),
+        bool(state.get("peer_user_config")),
     )
     if not result.ok:
         st.append_message(run, "system", args.phase, f"Peer turn failed: {result.error}", kind="peer_error")
@@ -122,13 +130,15 @@ def cmd_peer(args: argparse.Namespace) -> int:
         st.save_state(run, st.updated(fresh, peer_session=result.session, peer_turns=fresh["peer_turns"] + 1))
         warn(result.error)
         return EXIT_PEER_FAILED
+    after = gates.fingerprint(workspace)
+    broke_read_only = before is not None and before != after
     verdict = gates.parse_verdict(result.reply)
-    ignored = verdict if (args.write and verdict == "approve") else None
+    ignored = verdict if ((args.write or broke_read_only) and verdict == "approve") else None
     meta = {
         "verdict": None if ignored else verdict,
         "verdict_ignored": ignored,
-        "write": args.write,
-        "fingerprint": gates.fingerprint(Path(state["workspace"])),
+        "write": args.write or broke_read_only,
+        "fingerprint": after,
     }
     st.append_message(run, state["peer"], args.phase, result.reply, meta=meta)
     fresh = st.load_state(run)  # the turn can take a long time; do not overwrite changes made meanwhile
@@ -137,6 +147,12 @@ def cmd_peer(args: argparse.Namespace) -> int:
         withheld=held, peer_turns=fresh["peer_turns"] + 1,
     ))
     emit(result.reply)
+    if broke_read_only:
+        text = (f"Files in the workspace changed during a read-only turn by {state['peer']}. "
+                "Inspect the change before continuing; any approval in that turn is not counted.")
+        st.append_message(run, "system", args.phase, text, kind="readonly_violation")
+        warn(text)
+        return EXIT_READONLY_BROKEN
     if ignored:
         warn("the peer approved in a turn where it could edit files; that approval is not counted")
     return EXIT_OK
@@ -236,6 +252,9 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--peer", default="codex", choices=sorted(st.HOST_FOR_PEER))
     init.add_argument("--peer-model", help="override the peer client's own default model")
     init.add_argument("--peer-effort", help="Codex reasoning effort for this run; its own default if omitted")
+    init.add_argument("--peer-user-config", action="store_true",
+                      help="Claude peer only: load your personal Claude setup (hooks, instructions, plugins) "
+                           "instead of a clean session")
     init.add_argument("--max-turns", type=int, default=st.DEFAULT_MAX_TURNS)
     init.set_defaults(func=cmd_init)
 

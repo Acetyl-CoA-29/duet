@@ -20,6 +20,7 @@ two participants instead of a council, and they build the thing rather than only
           messages.jsonl    the same, as the source of truth
           state.json        session id, turn count, last check, caps
           turns/NNN/        exact prompt and raw output of each peer turn
+          drafts/           where the host writes its message files
 ```
 
 - **The host** is the model you are talking to. It takes part directly.
@@ -52,6 +53,29 @@ fingerprint). Any later edit reopens the gate.
 - **Stall**: three identical acceptance failures in a row block further peer turns until you weigh in.
 - **Peer failure or timeout**: recorded in the conversation; the session is kept and resumed.
 
+## Both directions
+
+| Host | Peer | Start with | Peer's read-only turns | Peer's build turns |
+|---|---|---|---|---|
+| Claude Code | Codex | `init ...` | Codex sandbox `read-only` | Codex sandbox `workspace-write` |
+| Codex | Claude | `init --peer claude ...` | Claude plan mode | Claude edit mode |
+
+Both have been run live end to end. Notes for **Codex as host**:
+
+- The Claude client needs the network and its own folder, which Codex's default sandbox blocks.
+  Start Codex with `-c 'sandbox_workspace_write.network_access=true' --add-dir ~/.claude`, or
+  approve the `peer` command to run outside the sandbox. The runner refuses with this message
+  when it detects a Codex sandbox without network.
+- Claude joins as a clean session (`--safe-mode`): no personal hooks, instructions or plugins.
+  `--peer-user-config` loads them instead; measured on a one-line reply, that cost about six
+  times as much.
+- When the host itself is sandboxed, Claude's own command sandbox cannot start inside it, so the
+  runner lets the host's sandbox do the confining. When the host is not sandboxed, Claude runs
+  commands in its own sandbox with no network.
+- Plan mode blocks Claude's edit tools but shell commands are not write-proof, so the runner
+  compares the workspace before and after every read-only turn (either peer). If files changed,
+  `peer` exits 8, says so in the conversation, and drops any approval from that turn.
+
 ## Use
 
 In Claude Code or Codex, ask for it: "run a duet with Codex to build X", or `/duet`.
@@ -60,8 +84,9 @@ By hand:
 
 ```sh
 D="python3 ~/.agents/skills/duet/scripts/duet.py"
-$D init --workspace . --goal-file goal.md --accept "python3 -m pytest -q"   # prints the run folder
-$D say  --run <run> --phase propose --file my-proposal.md
+$D init --workspace . --goal-file .duet/goal.md --accept "python3 -m pytest -q"   # prints the run folder
+# write message files into <run>/drafts/ so they do not count as workspace changes
+$D say  --run <run> --phase propose --file <run>/drafts/proposal.md
 $D peer --run <run> --phase propose            # peer's blind proposal
 $D say  --run <run> --phase debate --file reply.md --verdict revise
 $D peer --run <run> --phase debate
@@ -74,7 +99,7 @@ $D status --run <run>                          # what is still blocking, as JSON
 ```
 
 Other options: `--peer claude` (when the host is Codex), `--peer-model`, `--peer-effort`
-(Codex reasoning effort for the run), `--waive-accept "<reason>"`, `accept --cmd` to replace the
+(Codex reasoning effort for the run), `--peer-user-config` (Claude peer), `--waive-accept "<reason>"`, `accept --cmd` to replace the
 acceptance command, `extend --turns N --reason "..."`.
 
 ## Install
@@ -95,8 +120,8 @@ Needs Python 3.9+ (standard library only) and the `codex` and `claude` clients s
   other lab's model. Keep secrets out of the goal and the workspace.
 - Peer turns use your Codex or Claude plan at that client's configured model and effort. A long
   run at maximum effort is expensive; `--peer-effort` and `--max-turns` are the controls.
-- Read-only turns rely on the peer client's own sandbox (`sandbox_mode="read-only"` for Codex,
-  plan mode for Claude).
+- Codex's read-only turns are enforced by its sandbox. Claude's rely on plan mode plus the
+  before-and-after file comparison described above.
 - The run folder `.duet/` is written inside the workspace; add it to `.gitignore` if you do not
   want transcripts committed.
 - The fingerprint covers files git tracks or would track; ignored files are not part of it.

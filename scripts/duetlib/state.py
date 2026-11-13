@@ -105,6 +105,7 @@ def new_run(
     max_turns: int,
     peer_model: Optional[str],
     peer_effort: Optional[str] = None,
+    peer_user_config: bool = False,
 ) -> Path:
     if peer not in HOST_FOR_PEER:
         raise DuetError(f"unknown peer '{peer}'; choose one of {sorted(HOST_FOR_PEER)}")
@@ -117,6 +118,7 @@ def new_run(
     run_id = datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(2)
     run = workspace.resolve() / RUN_ROOT / run_id
     (run / "turns").mkdir(parents=True)
+    (run / "drafts").mkdir()
     state: State = {
         "run_id": run_id,
         "status": "active",
@@ -126,6 +128,7 @@ def new_run(
         "host": HOST_FOR_PEER[peer],
         "peer_model": peer_model,
         "peer_effort": peer_effort,
+        "peer_user_config": peer_user_config,
         "peer_session": None,
         "peer_cursor": 0,
         "withheld": [],

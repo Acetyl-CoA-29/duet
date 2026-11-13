@@ -274,6 +274,10 @@ def test_claude_can_be_the_peer(env, capsys):
     assert cli.main(["peer", "--run", str(run), "--phase", "build", "--write"]) == 0
     first, second = calls(env)
     assert "-p" in first["argv"] and "plan" in first["argv"]
+    assert "--safe-mode" in first["argv"]
+    settings = json.loads(first["argv"][first["argv"].index("--settings") + 1])
+    assert settings["sandbox"]["enabled"] is True
+    assert "Plan mode" in first["stdin"] and "Plan mode" not in second["stdin"]
     assert "--resume" in second["argv"] and "claude-sess-9" in second["argv"]
     assert "acceptEdits" in second["argv"]
     assert st.read_messages(run)[-1]["speaker"] == "claude"
@@ -399,3 +403,43 @@ def test_reply_without_session_id_is_a_failure(env, capsys, monkeypatch):
     monkeypatch.setenv("FAKE_SESSION", "")
     assert cli.main(["peer", "--run", str(run), "--phase", "frame"]) == cli.EXIT_PEER_FAILED
     assert "session id" in st.read_messages(run)[-1]["text"]
+
+
+def test_claude_peer_can_load_user_config_when_asked(env, capsys):
+    run = start(env, capsys, "--accept", "true", "--peer", "claude", "--peer-user-config")
+    cli.main(["peer", "--run", str(run), "--phase", "frame"])
+    assert "--safe-mode" not in calls(env)[0]["argv"]
+
+
+def test_file_change_in_read_only_turn_is_flagged_and_approval_dropped(env, capsys, monkeypatch):
+    run = start(env, capsys, "--accept", "true")
+    monkeypatch.setenv("FAKE_WRITE_FILE", str(env["ws"] / "sneaky.py"))
+    assert cli.main(["peer", "--run", str(run), "--phase", "review"]) == cli.EXIT_READONLY_BROKEN
+    msgs = st.read_messages(run)
+    assert msgs[-1]["kind"] == "readonly_violation"
+    assert msgs[-2]["meta"]["verdict"] is None and msgs[-2]["meta"]["verdict_ignored"] == "approve"
+
+
+def test_claude_peer_under_codex_sandbox_uses_host_sandbox(env, capsys, monkeypatch):
+    monkeypatch.setenv("CODEX_SANDBOX", "seatbelt")
+    run = start(env, capsys, "--accept", "true", "--peer", "claude")
+    assert cli.main(["peer", "--run", str(run), "--phase", "frame"]) == 0
+    argv = calls(env)[0]["argv"]
+    assert "--settings" not in argv
+    assert argv[argv.index("--allowedTools") + 1] == "Bash"
+
+
+def test_claude_peer_refused_when_codex_sandbox_has_no_network(env, capsys, monkeypatch):
+    monkeypatch.setenv("CODEX_SANDBOX", "seatbelt")
+    monkeypatch.setenv("CODEX_SANDBOX_NETWORK_DISABLED", "1")
+    run = start(env, capsys, "--accept", "true", "--peer", "claude")
+    capsys.readouterr()
+    assert cli.main(["peer", "--run", str(run), "--phase", "frame"]) == cli.EXIT_USAGE
+    assert "network access" in capsys.readouterr().err and calls(env) == []
+
+
+def test_drafts_folder_is_outside_the_fingerprint(env, capsys):
+    run = start(env, capsys, "--accept", "true")
+    before = gates.fingerprint(env["ws"])
+    (run / "drafts" / "review.md").write_text("my review")
+    assert gates.fingerprint(env["ws"]) == before
