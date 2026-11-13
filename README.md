@@ -21,6 +21,7 @@ two participants instead of a council, and they build the thing rather than only
           state.json        session id, turn count, last check, caps
           turns/NNN/        exact prompt and raw output of each peer turn
           drafts/           where the host writes its message files
+          checks/NNN.log    full output of each acceptance run
 ```
 
 - **The host** is the model you are talking to. It takes part directly.
@@ -71,7 +72,12 @@ puts its output into the conversation.
 - The peer's process does not inherit the other lab's API key or common deploy secrets
   (`GITHUB_TOKEN`, AWS, npm, PyPI, Hugging Face, OpenRouter). `DUET_KEEP_ENV=NAME,NAME` keeps
   ones a build needs.
-- Run state is written under a file lock.
+- Run state is written under a file lock, and the run folder is added to the repository's
+  local git exclude list so transcripts are not committed by accident.
+- Every acceptance run's full output is saved under `checks/`; the conversation gets the start
+  and the end. A check that itself changes files names them and cannot close the run.
+- A peer session that failed before completing any turn is discarded, so the rules and the goal
+  are always delivered.
 
 ## Both directions
 

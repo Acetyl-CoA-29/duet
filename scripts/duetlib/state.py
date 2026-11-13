@@ -140,6 +140,18 @@ def reveal_sealed(run: Path, speaker: str) -> None:
                          f"{message['text'].rstrip()}\n\n")
 
 
+def _git_exclude(workspace: Path) -> None:
+    """Keep transcripts out of commits: list the run folder in the repository's local exclude file."""
+    info = workspace / ".git" / "info"
+    if not info.is_dir():
+        return
+    exclude = info / "exclude"
+    current = exclude.read_text(encoding="utf-8") if exclude.is_file() else ""
+    if f"{RUN_ROOT}/" not in current.splitlines():
+        with exclude.open("a", encoding="utf-8") as fh:
+            fh.write(("" if current.endswith("\n") or not current else "\n") + f"{RUN_ROOT}/\n")
+
+
 def new_run(
     workspace: Path,
     goal: str,
@@ -166,6 +178,8 @@ def new_run(
     run = workspace.resolve() / RUN_ROOT / run_id
     (run / "turns").mkdir(parents=True)
     (run / "drafts").mkdir()
+    (run / "checks").mkdir()
+    _git_exclude(workspace.resolve())
     state: State = {
         "run_id": run_id,
         "status": "active",
@@ -185,6 +199,8 @@ def new_run(
         "skip_proposals": skip_proposals,
         "nonce": secrets.token_hex(4),
         "seen_fingerprint": seen_fingerprint,
+        "init_fingerprint": seen_fingerprint,
+        "peer_primed": False,
         "last_writer": None,
         "last_peer_failed": False,
         "max_turns": max_turns,

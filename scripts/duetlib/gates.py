@@ -24,12 +24,13 @@ VOLATILE_RE = re.compile(
     r"0x[0-9a-fA-F]+"
     r"|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
     r"|(?:/private)?/(?:tmp|var/folders)/\S+"
-    r"|\d+"
+    r"|\d+(?:\.\d+)?\s?(?:ms|s|sec|secs|seconds|min)\b"
 )
 CHECK_TIMEOUT_SECONDS = 1800
 OUTPUT_TAIL_LINES = 80
+OUTPUT_HEAD_LINES = 25
 OUTPUT_TAIL_CHARS = 6000
-VERDICT_RE = re.compile(r"^[\s*_`>#-]*VERDICT:\s*(APPROVE|REVISE)\b[\s*_`.]*$", re.IGNORECASE)
+VERDICT_RE = re.compile(r"^[\s*_`#-]*VERDICT:\s*(APPROVE|REVISE)\b[\s*_`.]*$", re.IGNORECASE)
 
 
 def parse_verdict(text: str) -> Optional[str]:
@@ -100,23 +101,48 @@ def _file_digest(path: Path) -> bytes:
     return hasher.digest()
 
 
-def fingerprint(workspace: Path) -> str:
-    """Digest of every source file, so 'what was checked' can be compared with 'what is there now'."""
+def manifest(workspace: Path) -> Dict[str, str]:
+    """Digest of every source file by path, so a change can be named as well as detected."""
     names = _git_files(workspace)
     if names is None:
         names = _walk_files(workspace)
-    digest = hashlib.sha256()
+    found: Dict[str, str] = {}
     for name in sorted(set(names)):
         if Path(name).parts[0] in (RUN_ROOT, ".git"):
             continue
         path = workspace / name
-        digest.update(name.encode("utf-8", "replace") + b"\0")
         try:
-            digest.update(b"x" if path.lstat().st_mode & 0o111 else b"-")
-            digest.update(_file_digest(path))
+            mode = b"x" if path.lstat().st_mode & 0o111 else b"-"
+            found[name] = hashlib.sha256(mode + _file_digest(path)).hexdigest()
         except OSError:
-            digest.update(b"<unreadable-or-deleted>")
+            found[name] = "unreadable-or-deleted"
+    return found
+
+
+def digest_of(files: Dict[str, str]) -> str:
+    digest = hashlib.sha256()
+    for name in sorted(files):
+        digest.update(name.encode("utf-8", "replace") + b"\0" + files[name].encode("ascii") + b"\n")
     return digest.hexdigest()
+
+
+def fingerprint(workspace: Path) -> str:
+    """One digest for the whole workspace: 'what was checked' against 'what is there now'."""
+    return digest_of(manifest(workspace))
+
+
+def changed_files(before: Dict[str, str], after: Dict[str, str]) -> List[str]:
+    return sorted(name for name in set(before) | set(after) if before.get(name) != after.get(name))
+
+
+def excerpt(output: str) -> str:
+    """The start and the end of long output: the first error and the final summary both matter."""
+    lines = output.splitlines()
+    if len(lines) > OUTPUT_HEAD_LINES + OUTPUT_TAIL_LINES:
+        omitted = len(lines) - OUTPUT_HEAD_LINES - OUTPUT_TAIL_LINES
+        lines = lines[:OUTPUT_HEAD_LINES] + [f"... {omitted} lines omitted ..."] + lines[-OUTPUT_TAIL_LINES:]
+    text = "\n".join(lines)
+    return text if len(text) <= OUTPUT_TAIL_CHARS else text[:1500] + "\n... cut ...\n" + text[-(OUTPUT_TAIL_CHARS - 1500):]
 
 
 def _tail(text: str) -> str:
@@ -125,7 +151,7 @@ def _tail(text: str) -> str:
 
 
 def run_command(command: str, workspace: Path, timeout: int) -> Tuple[Optional[int], str]:
-    """Run one shell command in the workspace; return (exit code or None on timeout, output tail)."""
+    """Run one shell command in the workspace; return (exit code or None on timeout, full output)."""
     with tempfile.TemporaryFile() as sink:
         # Own process group and a file sink: a timeout stops everything the command started,
         # and a leftover background process cannot keep us waiting on a pipe.
@@ -142,7 +168,7 @@ def run_command(command: str, workspace: Path, timeout: int) -> Tuple[Optional[i
         output = sink.read().decode("utf-8", "replace")
     if code is None:
         output += f"\ncommand timed out after {timeout}s"
-    return code, _tail(output)
+    return code, output
 
 
 def stop_group(child: "subprocess.Popen[bytes]", grace: int = 5) -> None:
@@ -178,17 +204,19 @@ def change_summary(workspace: Path) -> str:
 def run_check(state: State, timeout: int = CHECK_TIMEOUT_SECONDS) -> Dict[str, Any]:
     """Run the acceptance command the two models agreed on, inside the workspace."""
     workspace = Path(state["workspace"])
-    before = fingerprint(workspace)
-    code, tail = run_command(state["accept_cmd"], workspace, timeout)
-    normalised = VOLATILE_RE.sub("N", f"{code}\n{tail}")
-    after = fingerprint(workspace)
+    before = manifest(workspace)
+    code, output = run_command(state["accept_cmd"], workspace, timeout)
+    after = manifest(workspace)
+    normalised = VOLATILE_RE.sub("N", f"{code}\n{_tail(output)}")
     return {
         "passed": code == 0,
         "stable": before == after,
+        "changed_during": changed_files(before, after),
         "exit_code": code,
-        "output": tail,
+        "output": excerpt(output),
+        "full_output": output,
         "digest": hashlib.sha256(normalised.encode("utf-8")).hexdigest(),
-        "fingerprint": after,
+        "fingerprint": digest_of(after),
     }
 
 
@@ -208,11 +236,19 @@ def is_stalled(state: State, messages: List[Message]) -> bool:
     return not any(m["speaker"] == "user" and m["seq"] > since for m in messages)
 
 
-def _latest_verdict(messages: List[Message], speaker: str) -> Optional[Message]:
-    for message in reversed(messages):
-        if message["speaker"] == speaker and message["phase"] == "review" and message["meta"].get("verdict"):
-            return message
-    return None
+def review_standing(messages: List[Message], speaker: str, after_seq: int) -> Tuple[Optional[Message], str]:
+    """The speaker's latest review-phase message and why it does not count as an approval ('' if it does)."""
+    latest = next((m for m in reversed(messages)
+                   if m["speaker"] == speaker and m["phase"] == "review" and m["kind"] == "message"), None)
+    if latest is None or not (latest["meta"].get("verdict") or latest["meta"].get("verdict_ignored")):
+        said_more = latest is not None
+        return latest, (f"{speaker}'s latest review message carries no verdict" if said_more
+                        else f"{speaker} has not given a verdict in the review phase")
+    if latest["meta"].get("verdict") != "approve":
+        return latest, f"{speaker}'s latest review verdict is not an approval that counts"
+    if latest["seq"] < after_seq:
+        return latest, f"{speaker} approved before the last acceptance run; {speaker} must review again"
+    return latest, ""
 
 
 def both_proposed(state: State, messages: List[Message]) -> bool:
@@ -252,12 +288,11 @@ def finish_report(state: State, messages: List[Message]) -> Tuple[bool, List[str
             blocking.append("files changed after the last passing acceptance run; run check again")
     writer = current_writer(state, current)
     reviewers = [s for s in (state["host"], state["peer"]) if s != writer]
+    after_seq = 0 if state.get("accept_waived") else (state.get("last_check") or {}).get("seq", 0)
     for speaker in reviewers:
-        verdict = _latest_verdict(messages, speaker)
-        if verdict is None:
-            blocking.append(f"{speaker} has not given a verdict in the review phase")
-        elif verdict["meta"]["verdict"] != "approve":
-            blocking.append(f"{speaker}'s latest review verdict is revise")
-        elif verdict["meta"].get("fingerprint") != current:
+        verdict, problem = review_standing(messages, speaker, after_seq)
+        if problem:
+            blocking.append(problem)
+        elif verdict is not None and verdict["meta"].get("fingerprint") != current:
             blocking.append(f"files changed after {speaker} approved; {speaker} must review again")
     return (not blocking, blocking)

@@ -149,6 +149,7 @@ def test_sandbox_is_read_only_unless_write_requested(env, capsys):
     ("I would say VERDICT: APPROVE in the middle of a line", None),
     ("no verdict here", None),
     ("**VERDICT: APPROVE**", "approve"),
+    ("You wrote:\n> VERDICT: APPROVE\nI do not agree.", None),
 ])
 def test_parse_verdict(text, expected):
     assert gates.parse_verdict(text) == expected
@@ -237,18 +238,26 @@ def test_repeated_identical_failure_stalls_until_user_speaks(env, capsys):
     assert cli.main(["peer", "--run", str(run), "--phase", "build"]) == 0
 
 
-def test_peer_failure_is_recorded_and_session_kept(env, capsys, monkeypatch):
+def test_failed_first_turn_starts_over_with_the_rules(env, capsys, monkeypatch):
     run = start(env, capsys, "--accept", "true")
     say(env, run, "a", "--phase", "frame")
     monkeypatch.setenv("FAKE_EXIT", "7")
     assert cli.main(["peer", "--run", str(run), "--phase", "frame"]) == cli.EXIT_PEER_FAILED
     state = st.load_state(run)
-    assert state["peer_session"] == "sess-123" and state["peer_turns"] == 1  # failed attempts count toward the cap
+    assert state["peer_session"] is None and state["peer_turns"] == 1  # failed attempts count toward the cap
     assert st.read_messages(run)[-1]["kind"] == "peer_error"
     monkeypatch.delenv("FAKE_EXIT")
     assert cli.main(["peer", "--run", str(run), "--phase", "frame"]) == 0
     retry = calls(env)[-1]
-    assert "resume" in retry["argv"] and "\na\n" in retry["stdin"]
+    assert "resume" not in retry["argv"] and "Build a tiny greeter." in retry["stdin"] and "\na\n" in retry["stdin"]
+
+
+def test_failure_after_a_good_turn_keeps_the_session(env, capsys, monkeypatch):
+    run = start(env, capsys, "--accept", "true")
+    cli.main(["peer", "--run", str(run), "--phase", "frame"])
+    monkeypatch.setenv("FAKE_EXIT", "7")
+    assert cli.main(["peer", "--run", str(run), "--phase", "frame"]) == cli.EXIT_PEER_FAILED
+    assert st.load_state(run)["peer_session"] == "sess-123"
 
 
 def test_peer_timeout_is_reported(env, capsys, monkeypatch):
@@ -257,7 +266,6 @@ def test_peer_timeout_is_reported(env, capsys, monkeypatch):
     monkeypatch.setenv("FAKE_SLEEP", "5")
     assert cli.main(["peer", "--run", str(run), "--phase", "frame", "--timeout", "1"]) == cli.EXIT_PEER_FAILED
     assert "timed out" in st.read_messages(run)[-1]["text"]
-    assert st.load_state(run)["peer_session"] == "sess-123"
 
 
 def test_reply_falls_back_to_event_stream(env, capsys, monkeypatch):
@@ -623,13 +631,14 @@ def test_new_session_replays_the_conversation(env, capsys):
 
 def test_retry_after_failure_says_messages_may_repeat(env, capsys, monkeypatch):
     run = start(env, capsys, "--accept", "true")
+    cli.main(["peer", "--run", str(run), "--phase", "frame"])
     monkeypatch.setenv("FAKE_EXIT", "7")
     cli.main(["peer", "--run", str(run), "--phase", "frame"])
     monkeypatch.delenv("FAKE_EXIT")
     cli.main(["peer", "--run", str(run), "--phase", "frame"])
-    assert "interrupted" in calls(env)[1]["stdin"]
+    assert "interrupted" in calls(env)[2]["stdin"] and "resume" in calls(env)[2]["argv"]
     cli.main(["peer", "--run", str(run), "--phase", "frame"])
-    assert "interrupted" not in calls(env)[2]["stdin"]
+    assert "interrupted" not in calls(env)[3]["stdin"]
 
 
 def test_review_prompt_lists_changed_files_in_git_workspace(env, capsys):
@@ -661,3 +670,85 @@ def test_check_timeout_does_not_hang_on_background_process(env, capsys):
     run = start(env, capsys, "--accept", "sleep 30 & sleep 30")
     assert cli.main(["check", "--run", str(run), "--timeout", "1"]) == cli.EXIT_CHECK_FAILED
     assert "timed out" in st.read_messages(run)[-1]["text"]
+
+
+def test_approval_given_before_the_last_check_does_not_count(env, capsys):
+    run = start(env, capsys, "--accept", "true")
+    approve_both(env, run)
+    cli.main(["check", "--run", str(run)])
+    assert cli.main(["finish", "--run", str(run)]) == cli.EXIT_NOT_DONE
+    assert "before the last acceptance run" in capsys.readouterr().out
+
+
+def test_later_review_message_without_verdict_withdraws_approval(env, capsys, monkeypatch):
+    run = start(env, capsys, "--accept", "true")
+    cli.main(["check", "--run", str(run)])
+    approve_both(env, run)
+    monkeypatch.setenv("FAKE_REPLY", "Wait, I spotted a race condition.")
+    cli.main(["peer", "--run", str(run), "--phase", "review"])
+    assert cli.main(["finish", "--run", str(run)]) == cli.EXIT_NOT_DONE
+    assert "carries no verdict" in capsys.readouterr().out
+
+
+def test_status_shows_verdicts_and_check_validity(env, capsys):
+    run = start(env, capsys, "--accept", "true")
+    cli.main(["check", "--run", str(run)])
+    approve_both(env, run)
+    (env["ws"] / "app.py").write_text("changed\n")
+    capsys.readouterr()
+    cli.main(["status", "--run", str(run)])
+    report = json.loads(capsys.readouterr().out)
+    assert report["review_verdicts"] == {"claude": "approve", "codex": "approve"}
+    assert report["last_check_passed"] is True and report["check_valid_on_current_files"] is False
+
+
+def test_unexpected_fault_has_its_own_exit_code(env, capsys, monkeypatch):
+    run = start(env, capsys, "--accept", "true")
+    monkeypatch.setattr(gates, "run_check", lambda *a, **k: (_ for _ in ()).throw(KeyError("schema")))
+    assert cli.main(["check", "--run", str(run)]) == cli.EXIT_INTERNAL
+
+
+def test_run_folder_is_added_to_git_exclude(env, capsys):
+    ws = _git_workspace(env)
+    start(env, capsys, "--accept", "true")
+    start(env, capsys, "--accept", "true")
+    assert (ws / ".git" / "info" / "exclude").read_text().splitlines().count(".duet/") == 1
+
+
+def test_falling_failure_count_is_not_a_stall(env, capsys):
+    (env["ws"] / "n.txt").write_text("5")
+    run = start(env, capsys, "--accept", "n=$(cat n.txt); echo \"$n failed\"; echo $((n-1)) > n.txt; exit 1")
+    for _ in range(3):
+        cli.main(["check", "--run", str(run)])
+    assert st.load_state(run)["fail_streak"]["count"] == 1
+
+
+def test_check_log_is_saved_in_full_and_byproducts_are_named(env, capsys):
+    run = start(env, capsys, "--accept", "seq 1 500; echo x >> report.xml")
+    assert cli.main(["check", "--run", str(run)]) == 0
+    text = st.read_messages(run)[-1]["text"]
+    assert "lines omitted" in text and "report.xml" in text
+    assert len((run / "checks" / "001.log").read_text().splitlines()) == 500
+
+
+def test_check_that_passes_untouched_workspace_is_called_out(env, capsys):
+    run = start(env, capsys, "--accept", "true")
+    cli.main(["check", "--run", str(run)])
+    assert "no file changed since the run started" in st.read_messages(run)[-1]["text"]
+
+
+def test_read_only_violation_is_flagged_even_when_the_turn_fails(env, capsys, monkeypatch):
+    run = start(env, capsys, "--accept", "true")
+    wrapper = env["tmp"] / "bad_peer.sh"
+    wrapper.write_text(f"#!/bin/sh\ncat > /dev/null\necho sneaky > {env['ws']}/sneaky.py\nexit 9\n")
+    wrapper.chmod(0o755)
+    monkeypatch.setenv("DUET_CODEX_BIN", str(wrapper))
+    assert cli.main(["peer", "--run", str(run), "--phase", "review"]) == cli.EXIT_PEER_FAILED
+    assert st.read_messages(run)[-1]["kind"] == "readonly_violation"
+
+
+def test_init_warns_when_api_key_may_override_plan_billing(env, capsys, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "x")
+    goal = write(env["tmp"], "goal.md", "x")
+    assert cli.main(["init", "--workspace", str(env["ws"]), "--goal-file", goal, "--accept", "true"]) == 0
+    assert "may bill that API key" in capsys.readouterr().err

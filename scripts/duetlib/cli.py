@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -19,6 +20,9 @@ EXIT_PEER_FAILED = 5
 EXIT_BLIND = 6
 EXIT_NOT_DONE = 7
 EXIT_READONLY_BROKEN = 8
+EXIT_INTERNAL = 70
+READONLY_TEXT = ("Files in the workspace changed during a read-only turn by {peer}. "
+                 "Inspect the change before continuing; any approval in that turn is not counted.")
 BLIND_PHASES = ("frame", "propose")  # the host's sealed proposal is not released in these
 
 
@@ -58,6 +62,10 @@ def cmd_init(args: argparse.Namespace) -> int:
         args.peer_user_config, args.max_cost, args.skip_proposals,
         gates.fingerprint(Path(args.workspace)) if Path(args.workspace).is_dir() else None,
     )
+    own_key = {"codex": "OPENAI_API_KEY", "claude": "ANTHROPIC_API_KEY"}[args.peer]
+    if os.environ.get(own_key):
+        warn(f"{own_key} is set in this environment: the {args.peer} client may bill that API key "
+             "instead of the subscription plan")
     emit(str(run))
     return EXIT_OK
 
@@ -185,10 +193,16 @@ def cmd_peer(args: argparse.Namespace) -> int:
     after = gates.fingerprint(workspace)
     if after != before:
         authorship = {"seen_fingerprint": after, "last_writer": state["peer"]}
+    primed = state.get("peer_primed", state["peer_session"] is not None) and not args.new_session
     if not result.ok:
         st.append_message(run, "system", args.phase, f"Peer turn failed: {result.error}", kind="peer_error")
+        if not args.write and before != after:
+            st.append_message(run, "system", args.phase, READONLY_TEXT.format(peer=state["peer"]),
+                              kind="readonly_violation")
         fresh = st.load_state(run)
-        st.save_state(run, st.updated(fresh, peer_session=result.session or session, last_peer_failed=True,
+        # A session that never completed a turn may not hold the rules and the goal: start over next time.
+        kept = (result.session or session) if primed else None
+        st.save_state(run, st.updated(fresh, peer_session=kept, last_peer_failed=primed,
                                       peer_turns=fresh["peer_turns"] + 1, **authorship))
         warn(result.error)
         return EXIT_PEER_FAILED
@@ -209,12 +223,12 @@ def cmd_peer(args: argparse.Namespace) -> int:
     st.save_state(run, st.updated(
         fresh, peer_session=result.session, peer_cursor=messages[-1]["seq"] if messages else 0,
         withheld=held, peer_turns=fresh["peer_turns"] + 1,
-        peer_usage=_add_usage(fresh.get("peer_usage"), result.usage), last_peer_failed=False, **authorship,
+        peer_usage=_add_usage(fresh.get("peer_usage"), result.usage), last_peer_failed=False, peer_primed=True,
+        **authorship,
     ))
     emit(result.reply)
     if broke_read_only:
-        text = (f"Files in the workspace changed during a read-only turn by {state['peer']}. "
-                "Inspect the change before continuing; any approval in that turn is not counted.")
+        text = READONLY_TEXT.format(peer=state["peer"])
         st.append_message(run, "system", args.phase, text, kind="readonly_violation")
         warn(text)
         return EXIT_READONLY_BROKEN
@@ -231,7 +245,20 @@ def cmd_check(args: argparse.Namespace) -> int:
     authorship = _observed(state, gates.fingerprint(Path(state["workspace"])), state["host"])
     result = gates.run_check(state, args.timeout)
     outcome = "PASSED" if result["passed"] else f"FAILED (exit {result['exit_code']})"
-    text = f"Acceptance `{state['accept_cmd']}` {outcome}.\n\n```\n{result['output']}\n```"
+    number = len(list((run / "checks").glob("*.log"))) + 1 if (run / "checks").is_dir() else 0
+    log_note = ""
+    if number:
+        log = run / "checks" / f"{number:03d}.log"
+        log.write_text(result["full_output"], encoding="utf-8")
+        log_note = f"\n\nFull output: {log}"
+    text = f"Acceptance `{state['accept_cmd']}` {outcome}.\n\n```\n{result['output']}\n```{log_note}"
+    if not result["stable"]:
+        names = ", ".join(result["changed_during"][:10])
+        text += (f"\n\nThe command itself changed files ({names}), so this result cannot close the run. "
+                 "Add its by-products to .gitignore or stop it writing them, then run check again.")
+    if result["passed"] and result["fingerprint"] == state.get("init_fingerprint"):
+        text += ("\n\nNote: this passed with no file changed since the run started, "
+                 "so the command may not actually test the goal.")
     message = st.append_message(run, "system", "test", text, kind="check",
                                 meta={"passed": result["passed"], "exit_code": result["exit_code"]})
     st.save_state(run, st.updated(
@@ -252,7 +279,7 @@ def cmd_experiment(args: argparse.Namespace) -> int:
     if not args.cmd.strip():
         raise st.DuetError("the experiment command is empty")
     code, output = gates.run_command(args.cmd, Path(state["workspace"]), args.timeout)
-    text = f"Experiment `{args.cmd}` exited {code}.\n\n```\n{output}\n```"
+    text = f"Experiment `{args.cmd}` exited {code}.\n\n```\n{gates.excerpt(output)}\n```"
     st.append_message(run, "system", "debate", text, kind="experiment", meta={"exit_code": code})
     emit(text)
     return EXIT_OK if code == 0 else EXIT_CHECK_FAILED
@@ -291,15 +318,24 @@ def _report(run: Path) -> Dict[str, Any]:
     state = st.load_state(run)
     messages = st.read_messages(run)
     ready, blocking = gates.finish_report(state, messages)
+    current = gates.fingerprint(Path(state["workspace"]))
+    check = state["last_check"] or {}
+    verdicts = {}
+    for speaker in (state["host"], state["peer"]):
+        latest = gates.review_standing(messages, speaker, 0)[0]
+        verdicts[speaker] = (latest["meta"].get("verdict") if latest else None)
     return {
         "run": str(run), "status": state["status"], "host": state["host"], "peer": state["peer"],
         "peer_session": state["peer_session"], "peer_turns": state["peer_turns"],
         "max_turns": state["max_turns"], "messages": len(messages),
         "peer_usage": state.get("peer_usage"), "max_cost_usd": state.get("max_cost_usd"),
         "accept_cmd": state["accept_cmd"], "accept_waived": state["accept_waived"],
-        "last_check_passed": (state["last_check"] or {}).get("passed"),
+        "last_check_passed": check.get("passed"),
+        "check_valid_on_current_files": bool(check.get("passed") and check.get("stable", True)
+                                             and check.get("fingerprint") == current),
+        "review_verdicts": verdicts,
         "stalled": gates.is_stalled(state, messages),
-        "last_writer": gates.current_writer(state, gates.fingerprint(Path(state["workspace"]))),
+        "last_writer": gates.current_writer(state, current),
         "proposals_recorded": gates.both_proposed(state, messages),
         "ready_to_finish": ready, "blocking": blocking,
         "transcript": str(run / st.TRANSCRIPT_FILE),
@@ -410,3 +446,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     except (st.DuetError, OSError) as exc:
         warn(str(exc))
         return EXIT_USAGE
+    except Exception as exc:  # noqa: BLE001 - an unexpected fault must not look like a failed check (exit 1)
+        warn(f"internal error ({type(exc).__name__}): {exc}")
+        return EXIT_INTERNAL
