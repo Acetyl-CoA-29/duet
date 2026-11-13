@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
+import signal
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -14,6 +17,15 @@ SKIP_DIRS = frozenset({
     ".ruff_cache", ".venv", "venv", ".tox", "dist", "build", ".next", "coverage",
 })
 STALL_AFTER = 3
+HASH_CHUNK_BYTES = 1 << 16
+HUGE_FILE_BYTES = 100 * 1024 * 1024
+CHANGE_SUMMARY_LINES = 40
+VOLATILE_RE = re.compile(
+    r"0x[0-9a-fA-F]+"
+    r"|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+    r"|(?:/private)?/(?:tmp|var/folders)/\S+"
+    r"|\d+"
+)
 CHECK_TIMEOUT_SECONDS = 1800
 OUTPUT_TAIL_LINES = 80
 OUTPUT_TAIL_CHARS = 6000
@@ -23,7 +35,13 @@ VERDICT_RE = re.compile(r"^[\s*_`>#-]*VERDICT:\s*(APPROVE|REVISE)\b[\s*_`.]*$", 
 def parse_verdict(text: str) -> Optional[str]:
     """Return 'approve' or 'revise' from the last line that is only a verdict, else None."""
     found: Optional[str] = None
+    in_code = False
     for line in text.splitlines():
+        if line.lstrip().startswith(("```", "~~~")):
+            in_code = not in_code
+            continue
+        if in_code:
+            continue
         match = VERDICT_RE.match(line)
         if match:
             found = match.group(1).lower()
@@ -64,9 +82,22 @@ def _walk_files(workspace: Path) -> List[str]:
             if entry.is_dir() and not entry.is_symlink():
                 if entry.name not in SKIP_DIRS:
                     stack.append(entry)
-            elif entry.is_file() and not entry.name.endswith(".pyc"):
+            elif (entry.is_symlink() or entry.is_file()) and not entry.name.endswith(".pyc"):
                 found.append(entry.relative_to(workspace).as_posix())
     return found
+
+
+def _file_digest(path: Path) -> bytes:
+    if path.is_symlink():
+        return b"link:" + os.readlink(path).encode("utf-8", "replace")
+    info = path.stat()
+    if info.st_size > HUGE_FILE_BYTES:
+        return f"huge:{info.st_size}:{info.st_mtime_ns}".encode("ascii")
+    hasher = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(HASH_CHUNK_BYTES), b""):
+            hasher.update(chunk)
+    return hasher.digest()
 
 
 def fingerprint(workspace: Path) -> str:
@@ -81,8 +112,8 @@ def fingerprint(workspace: Path) -> str:
         path = workspace / name
         digest.update(name.encode("utf-8", "replace") + b"\0")
         try:
-            digest.update(b"x" if path.stat().st_mode & 0o111 else b"-")
-            digest.update(hashlib.sha256(path.read_bytes()).digest())
+            digest.update(b"x" if path.lstat().st_mode & 0o111 else b"-")
+            digest.update(_file_digest(path))
         except OSError:
             digest.update(b"<unreadable-or-deleted>")
     return digest.hexdigest()
@@ -93,21 +124,63 @@ def _tail(text: str) -> str:
     return "\n".join(lines)[-OUTPUT_TAIL_CHARS:]
 
 
+def run_command(command: str, workspace: Path, timeout: int) -> Tuple[Optional[int], str]:
+    """Run one shell command in the workspace; return (exit code or None on timeout, output tail)."""
+    with tempfile.TemporaryFile() as sink:
+        # Own process group and a file sink: a timeout stops everything the command started,
+        # and a leftover background process cannot keep us waiting on a pipe.
+        child = subprocess.Popen(  # noqa: S602 - commands here come from the user or the agreed plan
+            command, shell=True, cwd=str(workspace), stdout=sink, stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL, start_new_session=True,
+        )
+        try:
+            code: Optional[int] = child.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            code = None
+            stop_group(child)
+        sink.seek(0)
+        output = sink.read().decode("utf-8", "replace")
+    if code is None:
+        output += f"\ncommand timed out after {timeout}s"
+    return code, _tail(output)
+
+
+def stop_group(child: "subprocess.Popen[bytes]", grace: int = 5) -> None:
+    """Ask a child's whole process group to stop, then force it."""
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(child.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            return
+        try:
+            child.wait(timeout=grace)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
+def change_summary(workspace: Path) -> str:
+    """Short list of changed files for a reviewer, when the workspace is a git repository."""
+    try:
+        done = subprocess.run(["git", "status", "--short"], cwd=str(workspace), capture_output=True,
+                              timeout=60, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    if done.returncode != 0:
+        return ""
+    lines = [line for line in done.stdout.decode("utf-8", "replace").splitlines()
+             if not line[3:].startswith(RUN_ROOT)]
+    extra = len(lines) - CHANGE_SUMMARY_LINES
+    shown = lines[:CHANGE_SUMMARY_LINES] + ([f"... and {extra} more"] if extra > 0 else [])
+    return "\n".join(shown)
+
+
 def run_check(state: State, timeout: int = CHECK_TIMEOUT_SECONDS) -> Dict[str, Any]:
     """Run the acceptance command the two models agreed on, inside the workspace."""
     workspace = Path(state["workspace"])
     before = fingerprint(workspace)
-    try:
-        done = subprocess.run(  # noqa: S602 - the acceptance command is the user's own
-            state["accept_cmd"], shell=True, cwd=str(workspace),
-            capture_output=True, timeout=timeout, check=False,
-        )
-        code: Optional[int] = done.returncode
-        output = (done.stdout + done.stderr).decode("utf-8", "replace")
-    except subprocess.TimeoutExpired:
-        code, output = None, f"acceptance command timed out after {timeout}s"
-    tail = _tail(output)
-    normalised = re.sub(r"\d+", "N", f"{code}\n{tail}")
+    code, tail = run_command(state["accept_cmd"], workspace, timeout)
+    normalised = VOLATILE_RE.sub("N", f"{code}\n{tail}")
     after = fingerprint(workspace)
     return {
         "passed": code == 0,
@@ -137,15 +210,34 @@ def is_stalled(state: State, messages: List[Message]) -> bool:
 
 def _latest_verdict(messages: List[Message], speaker: str) -> Optional[Message]:
     for message in reversed(messages):
-        if message["speaker"] == speaker and message["meta"].get("verdict"):
+        if message["speaker"] == speaker and message["phase"] == "review" and message["meta"].get("verdict"):
             return message
     return None
+
+
+def both_proposed(state: State, messages: List[Message]) -> bool:
+    speakers = {m["speaker"] for m in messages if m["phase"] == "propose"}
+    return state["host"] in speakers and state["peer"] in speakers
+
+
+def proposals_missing(state: State, messages: List[Message]) -> bool:
+    return not state.get("skip_proposals") and not both_proposed(state, messages)
+
+
+def current_writer(state: State, current: str) -> Optional[str]:
+    """Who last changed the files. A change nothing recorded is put down to the host's side."""
+    seen = state.get("seen_fingerprint")
+    if seen is not None and seen != current:
+        return state["host"]
+    return state.get("last_writer")
 
 
 def finish_report(state: State, messages: List[Message]) -> Tuple[bool, List[str]]:
     """Return (ready, reasons it is not ready)."""
     current = fingerprint(Path(state["workspace"]))
     blocking: List[str] = []
+    if proposals_missing(state, messages):
+        blocking.append("the blind proposal round was skipped: both models must record a proposal")
     if not state.get("accept_waived"):
         check = state.get("last_check")
         if not state.get("accept_cmd"):
@@ -158,12 +250,14 @@ def finish_report(state: State, messages: List[Message]) -> Tuple[bool, List[str
             blocking.append("files changed while the acceptance command was running; run check again")
         elif check["fingerprint"] != current:
             blocking.append("files changed after the last passing acceptance run; run check again")
-    for speaker in (state["host"], state["peer"]):
+    writer = current_writer(state, current)
+    reviewers = [s for s in (state["host"], state["peer"]) if s != writer]
+    for speaker in reviewers:
         verdict = _latest_verdict(messages, speaker)
         if verdict is None:
-            blocking.append(f"{speaker} has not given a verdict")
+            blocking.append(f"{speaker} has not given a verdict in the review phase")
         elif verdict["meta"]["verdict"] != "approve":
-            blocking.append(f"{speaker}'s latest verdict is revise")
+            blocking.append(f"{speaker}'s latest review verdict is revise")
         elif verdict["meta"].get("fingerprint") != current:
             blocking.append(f"files changed after {speaker} approved; {speaker} must review again")
     return (not blocking, blocking)

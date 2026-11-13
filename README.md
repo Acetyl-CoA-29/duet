@@ -35,23 +35,43 @@ two participants instead of a council, and they build the thing rather than only
 
 | Phase | What happens | Enforced by the runner |
 |---|---|---|
-| frame | Agree the goal and one acceptance command | A run needs an acceptance command or an explicit waiver |
-| propose | Each model writes its own approach | Blind: the peer cannot be asked until the host's proposal is recorded, and the host's proposal is withheld from the peer |
-| debate | Proposals revealed; each attacks, concedes, defends with evidence | |
+| frame | Agree the goal and one acceptance command | A run needs an acceptance command or an explicit waiver; the command locks when this phase ends and changing it later needs your agreement |
+| propose | Each model writes its own approach | Blind: the peer cannot be asked until the host's proposal is recorded; the host's proposal is withheld from the peer and stored encoded on disk until the peer has proposed |
+| debate | Proposals revealed; each attacks, concedes, defends with evidence, and picks one design | Refused until both proposals exist |
 | plan | One joint plan, driver and reviewer per task | |
-| build | One model edits at a time | The peer is read-only unless the turn is given write access |
+| build | One model edits at a time | The peer is read-only unless the turn is given write access, and build turns are refused before the blind round |
 | test | The acceptance command runs; real output goes into the conversation | |
-| review | The non-author reads the files and gives a verdict | An approval from a turn with write access is not counted |
+| review | Whoever did not write the latest change tries to break it and gives a verdict | Only review-phase verdicts count; the author's own approval is neither needed nor counted |
 
 `finish` succeeds only when the acceptance command last passed on the files exactly as they are
-now, and both models' latest verdicts are approve on those same files (compared by content
-fingerprint). Any later edit reopens the gate.
+now, and the model that did **not** make the latest change has approved those same files
+(compared by content fingerprint). If nothing was changed, both must approve. Any later edit
+reopens the gate. The runner tracks who wrote last by comparing the workspace around every
+command; an edit it did not see is put down to the host.
+
+`experiment --cmd "..."` runs a command the two models agreed would settle a disagreement and
+puts its output into the conversation.
 
 ### Stop conditions
 
-- **Turn cap**: 30 peer turns by default (`--max-turns`); raising it needs your say-so.
-- **Stall**: three identical acceptance failures in a row block further peer turns until you weigh in.
-- **Peer failure or timeout**: recorded in the conversation; the session is kept and resumed.
+- **Turn cap**: 30 peer turns by default (`--max-turns`), failed turns included; raising it needs your say-so.
+- **Cost cap**: `--max-cost <dollars>` stops peer turns once the peer's client has reported that
+  much. The Claude client reports cost; Codex reports tokens only, shown in `status`.
+- **Stall**: three acceptance failures in a row with the same output (ignoring numbers, memory
+  addresses and temp paths) block further peer turns until you weigh in.
+- **Peer failure or timeout**: recorded in the conversation; the peer's whole process group is
+  stopped; the session is kept and resumed, with a note that messages may repeat.
+  `peer --new-session` replays the conversation into a fresh session if the old one cannot resume.
+
+### Safeguards
+
+- Message text reaches the peer on standard input only, never in a command line.
+- Each message is wrapped in a tag carrying a per-run random marker, so text inside a message
+  (command output, quoted material) cannot pass itself off as another speaker.
+- The peer's process does not inherit the other lab's API key or common deploy secrets
+  (`GITHUB_TOKEN`, AWS, npm, PyPI, Hugging Face, OpenRouter). `DUET_KEEP_ENV=NAME,NAME` keeps
+  ones a build needs.
+- Run state is written under a file lock.
 
 ## Both directions
 
@@ -90,16 +110,17 @@ $D say  --run <run> --phase propose --file <run>/drafts/proposal.md
 $D peer --run <run> --phase propose            # peer's blind proposal
 $D say  --run <run> --phase debate --file reply.md --verdict revise
 $D peer --run <run> --phase debate
+$D experiment --run <run> --cmd "python3 probe.py"   # settle a dispute by evidence
 $D peer --run <run> --phase build --write      # peer drives a build turn
 $D check  --run <run>                          # run the acceptance command
-$D say  --run <run> --phase review --file review.md --verdict approve
-$D peer --run <run> --phase review
-$D finish --run <run>
+$D say  --run <run> --phase review --file <run>/drafts/review.md --verdict approve
+$D finish --run <run>                          # the peer wrote, the host approved: done
 $D status --run <run>                          # what is still blocking, as JSON
 ```
 
 Other options: `--peer claude` (when the host is Codex), `--peer-model`, `--peer-effort`
-(Codex reasoning effort for the run), `--peer-user-config` (Claude peer), `--waive-accept "<reason>"`, `accept --cmd` to replace the
+(Codex reasoning effort for the run), `--peer-user-config` (Claude peer), `--max-cost`,
+`--skip-proposals "<reason>"`, `peer --new-session`, `accept --by-user "<words>"`, `--waive-accept "<reason>"`, `accept --cmd` to replace the
 acceptance command, `extend --turns N --reason "..."`.
 
 ## Install
@@ -125,6 +146,11 @@ Needs Python 3.9+ (standard library only) and the `codex` and `claude` clients s
 - The run folder `.duet/` is written inside the workspace; add it to `.gitignore` if you do not
   want transcripts committed.
 - The fingerprint covers files git tracks or would track; ignored files are not part of it.
+  Files over 100 MB are compared by size and modification time, symbolic links by their target.
+- The blind round stops accidental anchoring, not a determined reader: the sealed proposal is
+  encoded, not encrypted, and the peer is told not to open `.duet/`.
+- There is no evidence yet that the pair beats one model working alone at the same budget.
+  That needs a comparison harness, which is not built.
 
 ## Tests
 

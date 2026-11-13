@@ -3,13 +3,22 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import signal
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
+
+from .gates import stop_group
 
 DEFAULT_TIMEOUT_SECONDS = 2400
 ERROR_TAIL_CHARS = 1500
+KILL_GRACE_SECONDS = 5
+BIN_ENV = {"codex": "DUET_CODEX_BIN", "claude": "DUET_CLAUDE_BIN"}
+OTHER_LAB_SECRETS = {"codex": ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"), "claude": ("OPENAI_API_KEY",)}
+COMMON_SECRETS = ("OPENROUTER_API_KEY", "GITHUB_TOKEN", "GH_TOKEN", "AWS_SECRET_ACCESS_KEY",
+                  "AWS_SESSION_TOKEN", "NPM_TOKEN", "PYPI_TOKEN", "HF_TOKEN")
 CLAUDE_SANDBOX_SETTINGS = json.dumps({"sandbox": {"enabled": True, "autoAllowBashIfSandboxed": True}})
 
 
@@ -18,8 +27,14 @@ def host_is_sandboxed() -> bool:
     return bool(os.environ.get("CODEX_SANDBOX"))
 
 
+def peer_binary(peer: str) -> str:
+    return os.environ.get(BIN_ENV[peer], peer)
+
+
 def launch_problem(peer: str) -> Optional[str]:
     """Explain up front why the peer cannot be reached from here, if that is the case."""
+    if shutil.which(peer_binary(peer)) is None:
+        return f"the `{peer_binary(peer)}` command-line client was not found; install it and sign in first"
     if peer == "claude" and os.environ.get("CODEX_SANDBOX_NETWORK_DISABLED") == "1":
         return ("the Codex sandbox this command runs in has no network access, so the Claude client cannot "
                 "be reached. Start Codex with network access and a writable ~/.claude, for example: "
@@ -33,11 +48,12 @@ class PeerResult:
     reply: str
     session: Optional[str]
     error: str = ""
+    usage: Optional[Dict[str, Any]] = None
 
 
 def _codex_command(session: Optional[str], write: bool, model: Optional[str], effort: Optional[str], last: Path) -> List[str]:
     sandbox = "workspace-write" if write else "read-only"
-    command = [os.environ.get("DUET_CODEX_BIN", "codex"), "exec"]
+    command = [peer_binary("codex"), "exec"]
     if session:
         command.append("resume")
     command += ["--skip-git-repo-check", "--json", "-o", str(last), "-c", f'sandbox_mode="{sandbox}"']
@@ -54,7 +70,7 @@ def _claude_command(session: Optional[str], write: bool, model: Optional[str], u
     """Claude as peer: plan mode for read-only turns, edit mode for build turns, and its own
     command sandbox in both so it can run tests without network or approval prompts."""
     command = [
-        os.environ.get("DUET_CLAUDE_BIN", "claude"), "-p", "--output-format", "json",
+        peer_binary("claude"), "-p", "--output-format", "json",
         "--permission-mode", "acceptEdits" if write else "plan",
     ]
     if host_is_sandboxed():
@@ -74,6 +90,7 @@ def _claude_command(session: Optional[str], write: bool, model: Optional[str], u
 def _parse_codex(events: str, last: Path) -> PeerResult:
     session: Optional[str] = None
     replies: List[str] = []
+    usage: Dict[str, Any] = {}
     for line in events.splitlines():
         try:
             event = json.loads(line)
@@ -83,6 +100,10 @@ def _parse_codex(events: str, last: Path) -> PeerResult:
             continue
         if event.get("type") == "thread.started":
             session = event.get("thread_id") or session
+        if event.get("type") == "turn.completed" and isinstance(event.get("usage"), dict):
+            raw = event["usage"]
+            usage = {"input_tokens": int(raw.get("input_tokens") or 0),
+                     "output_tokens": int(raw.get("output_tokens") or 0)}
         item = event.get("item")
         if not isinstance(item, dict):
             continue
@@ -92,20 +113,38 @@ def _parse_codex(events: str, last: Path) -> PeerResult:
     if not reply.strip() and replies:
         reply = replies[-1]
     return PeerResult(ok=bool(reply.strip()), reply=reply.strip(), session=session,
-                      error="" if reply.strip() else "the peer returned no message")
+                      error="" if reply.strip() else "the peer returned no message", usage=usage)
 
 
 def _parse_claude(output: str) -> PeerResult:
-    try:
-        data = json.loads(output.strip().splitlines()[-1])
-    except (json.JSONDecodeError, IndexError):
+    data: Any = None
+    candidates = [output.strip()] + list(reversed(output.strip().splitlines()))
+    for candidate in candidates:
+        try:
+            data = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict) and "result" in data:
+            break
+    else:
         return PeerResult(False, "", None, "the peer's output was not JSON")
     if not isinstance(data, dict):
         return PeerResult(False, "", None, "the peer's output was not a JSON object")
     reply = str(data.get("result") or "").strip()
     if data.get("is_error") or not reply:
         return PeerResult(False, "", data.get("session_id"), reply or "the peer reported an error")
-    return PeerResult(True, reply, data.get("session_id"))
+    raw = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+    cost = data.get("total_cost_usd")
+    usage = {"input_tokens": int(raw.get("input_tokens") or 0), "output_tokens": int(raw.get("output_tokens") or 0),
+             "cost_usd": float(cost) if isinstance(cost, (int, float)) else 0.0}
+    return PeerResult(True, reply, data.get("session_id"), usage=usage)
+
+
+def peer_env(peer: str) -> Dict[str, str]:
+    """The peer's environment without the other lab's key or common deploy secrets."""
+    keep = {name.strip() for name in os.environ.get("DUET_KEEP_ENV", "").split(",") if name.strip()}
+    drop = (set(OTHER_LAB_SECRETS[peer]) | set(COMMON_SECRETS)) - keep
+    return {name: value for name, value in os.environ.items() if name not in drop}
 
 
 def run_turn(
@@ -128,12 +167,15 @@ def run_turn(
     timed_out, code = False, None
     try:
         with out_path.open("wb") as out, err_path.open("wb") as err:
+            # Own process group, so a timeout stops the client and everything it started.
+            child = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=out, stderr=err,
+                                     cwd=str(workspace), start_new_session=True, env=peer_env(peer))
             try:
-                done = subprocess.run(command, input=prompt.encode("utf-8"), stdout=out, stderr=err,
-                                      cwd=str(workspace), timeout=timeout, check=False)
-                code = done.returncode
+                child.communicate(prompt.encode("utf-8"), timeout=timeout)
+                code = child.returncode
             except subprocess.TimeoutExpired:
                 timed_out = True
+                stop_group(child, KILL_GRACE_SECONDS)
     except OSError as exc:
         return PeerResult(False, "", session, f"could not start {command[0]}: {exc}")
     output = out_path.read_text(encoding="utf-8", errors="replace")
@@ -147,4 +189,4 @@ def run_turn(
     if parsed.ok and not kept:
         return PeerResult(False, "", None, "the peer replied without a session id, so the conversation "
                                            "could not be continued; its reply was discarded")
-    return PeerResult(parsed.ok, parsed.reply, kept, parsed.error)
+    return PeerResult(parsed.ok, parsed.reply, kept, parsed.error, parsed.usage)
