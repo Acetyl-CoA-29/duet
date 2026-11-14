@@ -19,6 +19,13 @@ from .turn import cmd_peer
 FROZEN_WHEN_DONE = ("say", "peer", "check", "accept", "extend", "experiment")  # commands a finished run refuses
 READ_ONLY_COMMANDS = ("status", "reseal")  # these never settle an abandoned peer turn
 FINISH_PHASES = (phases.BUILD, phases.REVIEW)
+USAGE_NOTE = {
+    "codex": ("tokens the Codex client reported for this run's peer turns. Codex reports a running total per "
+              "session, so the runner adds only the increase each turn; input_tokens includes cached input. "
+              "Codex reports no cost, so cost_usd stays 0"),
+    "claude": ("tokens and US dollars the Claude client reported, summed over this run's peer turns; each "
+               "report covers one turn"),
+}
 
 
 def _read_text(path: Optional[str]) -> str:
@@ -94,16 +101,14 @@ def cmd_say(args: argparse.Namespace) -> int:
     sealed = speaker == state["host"] and phase == phases.PROPOSE
     if phase != here and args.replan:
         turn.record_replan(run, here, args.replan)
-    message = st.append_message(run, speaker, phase, text, meta=meta, sealed=sealed)
-    if sealed:
-        _discard_draft(run, args.file)
-
-    def change(fresh: st.State) -> Dict[str, Any]:
+    def change(fresh: st.State, _seq: int) -> Dict[str, Any]:
         seen = authors.observed(fresh, messages, current, fresh["host"])
         quiet = {"fail_streak": {"digest": None, "count": 0}} if speaker == "user" else {}
         return {**seen, **quiet, "phase": phase if speaker != "user" else fresh.get("phase", phase)}
 
-    base.update(run, change)
+    message = st.append_message(run, speaker, phase, text, meta=meta, sealed=sealed, change=change)
+    if sealed:
+        _discard_draft(run, args.file)
     emit(f"recorded message {message['seq']} from {speaker}" + (" (sealed until the peer proposes)" if sealed else ""))
     return EXIT_OK
 
@@ -127,11 +132,14 @@ def _phase_now(run: Path, state: st.State) -> str:
 
 def cmd_check(args: argparse.Namespace) -> int:
     run = Path(args.run)
-    state = st.load_state(run)
-    if not state.get("accept_cmd"):
-        raise st.DuetError("no acceptance command is set; use `accept --cmd`")
-    found = gates.fingerprint(Path(state["workspace"]))  # an edit made before the check is the host's
-    result = gates.run_check(state, args.timeout)
+    with base.transaction(run) as state:
+        if not state.get("accept_cmd"):
+            raise st.DuetError("no acceptance command is set; use `accept --cmd`")
+        before = gates.manifest(Path(state["workspace"]))  # one scan serves authorship and the check's baseline
+        found = gates.digest_of(before)
+        messages = st.read_messages(run)
+        state = base.update(run, lambda fresh: authors.observed(fresh, messages, found, fresh["host"]))
+    result = gates.run_check(state, args.timeout, before=before)
     outcome = "PASSED" if result["passed"] else f"FAILED (exit {result['exit_code']})"
     number = len(list((run / "checks").glob("*.log"))) + 1 if (run / "checks").is_dir() else 0
     log_note = ""
@@ -147,19 +155,20 @@ def cmd_check(args: argparse.Namespace) -> int:
     if result["passed"] and result["fingerprint"] == state.get("init_fingerprint"):
         text += ("\n\nNote: this passed with no file changed since the run started, "
                  "so the command may not actually test the goal.")
-    messages = st.read_messages(run)
-    message = st.append_message(run, "system", phases.current(state, messages), text, kind="check",
-                                meta={"passed": result["passed"], "exit_code": result["exit_code"]})
-
-    def change(fresh: st.State) -> Dict[str, Any]:
-        seen = {**authors.observed(fresh, messages, found, fresh["host"]), "seen_fingerprint": result["fingerprint"]}
+    def change(fresh: st.State, seq: int) -> Dict[str, Any]:
+        # Authorship was recorded at admission; comparing the old baseline with a later
+        # peer receipt here would falsely attribute that peer's work to the host. The command's own
+        # by-products become the files last seen, unless another command recorded a change meanwhile.
+        seen = {"seen_fingerprint": result["fingerprint"]} if fresh.get("seen_fingerprint") == found else {}
         if fresh.get("accept_cmd") != state["accept_cmd"]:
             return seen  # the command was replaced while this one ran: its result proves nothing now
         return {**seen, "fail_streak": gates.next_streak(fresh["fail_streak"], result),
-                "last_check": {"seq": message["seq"], "passed": result["passed"], "stable": result["stable"],
+                "last_check": {"seq": seq, "passed": result["passed"], "stable": result["stable"],
                                "fingerprint": result["fingerprint"]}}
 
-    base.update(run, change)
+    with base.transaction(run) as fresh:
+        st.append_message(run, "system", _phase_now(run, fresh), text, kind="check",
+                          meta={"passed": result["passed"], "exit_code": result["exit_code"]}, change=change)
     emit(text)
     return EXIT_OK if result["passed"] else EXIT_CHECK_FAILED
 
@@ -172,7 +181,8 @@ def cmd_experiment(args: argparse.Namespace) -> int:
         raise st.DuetError("the experiment command is empty")
     code, output = gates.run_command(args.cmd, Path(state["workspace"]), args.timeout)
     text = f"Experiment `{args.cmd}` exited {code}.\n\n```\n{gates.excerpt(output)}\n```"
-    st.append_message(run, "system", _phase_now(run, state), text, kind="experiment", meta={"exit_code": code})
+    with base.transaction(run) as fresh:
+        st.append_message(run, "system", _phase_now(run, fresh), text, kind="experiment", meta={"exit_code": code})
     emit(text)
     return EXIT_OK if code == 0 else EXIT_CHECK_FAILED
 
@@ -187,11 +197,11 @@ def cmd_accept(args: argparse.Namespace) -> int:
     if here != phases.FRAME and not args.by_user:
         raise st.DuetError("the acceptance command is locked once the frame phase is over. Changing it now "
                            "needs the user's agreement: pass --by-user \"<their words>\"")
-    base.update(run, lambda fresh: {"accept_cmd": args.cmd if command else None, "accept_waived": waiver or None,
-                                    "last_check": None, "fail_streak": {"digest": None, "count": 0}})
     note = f" Changed with the user's agreement: {args.by_user}" if args.by_user else ""
     what = f"Acceptance command set to `{args.cmd}`." if command else f"Acceptance waived: {waiver}."
-    st.append_message(run, "system", here, what + note, kind="accept")
+    st.append_message(run, "system", here, what + note, kind="accept", change=lambda fresh, seq: {
+        "accept_cmd": args.cmd if command else None, "accept_waived": waiver or None,
+        "last_check": None, "fail_streak": {"digest": None, "count": 0}})
     emit("acceptance recorded; earlier check results no longer count")
     return EXIT_OK
 
@@ -206,9 +216,12 @@ def cmd_extend(args: argparse.Namespace) -> int:
     _dollars(args.cost, "--cost")
     if args.cost is not None and state.get("max_cost_usd") is None:
         raise st.DuetError("this run has no cost cap to raise (it was started without --max-cost)")
-    new = base.update(run, lambda fresh: {
-        "max_turns": fresh["max_turns"] + (args.turns or 0),
-        "max_cost_usd": fresh["max_cost_usd"] + args.cost if args.cost is not None else fresh.get("max_cost_usd")})
+    def change(fresh: st.State) -> Dict[str, Any]:
+        cap = fresh["max_cost_usd"] + args.cost if args.cost is not None else fresh.get("max_cost_usd")
+        _dollars(cap, "resulting cost cap")
+        return {"max_turns": fresh["max_turns"] + (args.turns or 0), "max_cost_usd": cap}
+
+    new = base.update(run, change)
     raised = ([f"turn cap raised to {new['max_turns']}"] if args.turns else []) + (
         [f"cost cap raised to ${new['max_cost_usd']:.2f}"] if args.cost is not None else [])
     summary = " and ".join(raised)
@@ -235,7 +248,7 @@ def _report(run: Path) -> Dict[str, Any]:
     current = gates.fingerprint(Path(state["workspace"]))
     done = state["status"] != "active"
     here = phases.current(state, messages)
-    blocking = gates.finish_report(authors.gate_view(state, messages, current), messages)[1]
+    blocking = gates.finish_report(authors.gate_view(state, messages, current), messages, current)[1]
     running = turn.turn_standing(run, state)
     if not done and here not in FINISH_PHASES:
         blocking.append(f"the run is in {here}: it can finish only from build or review, once the plan is carried out")
@@ -254,7 +267,8 @@ def _report(run: Path) -> Dict[str, Any]:
         "host": state["host"], "peer": state["peer"],
         "peer_session": state["peer_session"], "peer_turns": state["peer_turns"],
         "max_turns": state["max_turns"], "messages": len(messages), "peer_turn": running,
-        "peer_usage": state.get("peer_usage"), "max_cost_usd": state.get("max_cost_usd"),
+        "peer_usage": state.get("peer_usage"), "peer_usage_note": USAGE_NOTE[state["peer"]],
+        "max_cost_usd": state.get("max_cost_usd"),
         "accept_cmd": state["accept_cmd"], "accept_waived": state["accept_waived"],
         "last_check_passed": check.get("passed"),
         "check_valid_on_current_files": bool(check.get("passed") and check.get("stable", True)
@@ -284,8 +298,8 @@ def cmd_finish(args: argparse.Namespace) -> int:
         emit("Not finished. Still blocking:\n" + "\n".join(f"- {reason}" for reason in report["blocking"]))
         return EXIT_NOT_DONE
     summary = _finish_summary(report)
-    st.append_message(run, "system", report["phase"], f"Run finished: {summary}.", kind="finish")
-    base.update(run, lambda fresh: {"status": "done"})
+    st.append_message(run, "system", report["phase"], f"Run finished: {summary}.", kind="finish",
+                      change=lambda fresh, seq: {"status": "done"})
     emit(f"Finished: {summary}. Transcript: {report['transcript']}")
     return EXIT_OK
 
@@ -408,6 +422,7 @@ def _before(args: argparse.Namespace) -> Optional[int]:
     notice = st.verify_integrity(run)
     if notice:
         warn(notice)
+    st.reconcile(run)
     if args.command in READ_ONLY_COMMANDS:
         return None
     if st.load_state(run)["status"] != "active":
@@ -426,7 +441,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         return EXIT_USAGE if exc.code else EXIT_OK
     try:
         refusal = _before(args)
-        return args.func(args) if refusal is None else refusal
+        if refusal is not None:
+            return refusal
+        if getattr(args, "run", None) and args.command not in ("peer", "check", "experiment", "reseal"):
+            with base.transaction(Path(args.run), active=args.command in FROZEN_WHEN_DONE):
+                return args.func(args)
+        return args.func(args)
     except st.TamperError as exc:
         warn(str(exc))
         return EXIT_TAMPERED

@@ -9,6 +9,7 @@ import os
 import secrets
 import sys
 import tempfile
+import threading
 import zlib
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -26,6 +27,7 @@ SEALED_NOTE = "(sealed blind proposal; shown here once the peer has recorded its
 
 State = Dict[str, Any]
 Message = Dict[str, Any]
+_held_locks = threading.local()
 
 
 def now_iso() -> str:
@@ -41,12 +43,20 @@ def _write_atomic(path: Path, text: str) -> None:
 
 @contextmanager
 def locked(run: Path) -> Iterator[None]:
-    """Hold the run's lock so two commands cannot number a message or write state at once."""
-    with (run / ".lock").open("w") as fh:
+    """Serialize commands, allowing transaction helpers to nest in the same thread."""
+    key = str(run.resolve())
+    held = getattr(_held_locks, "runs", frozenset())
+    if key in held:
+        yield
+        return
+    lock = run / ".lock"
+    with lock.open("r" if lock.exists() else "a") as fh:
         fcntl.flock(fh, fcntl.LOCK_EX)
+        _held_locks.runs = held | {key}
         try:
             yield
         finally:
+            _held_locks.runs = held
             fcntl.flock(fh, fcntl.LOCK_UN)
 
 
@@ -88,10 +98,23 @@ def update_state(run: Path, change: Callable[[State], Dict[str, Any]]) -> State:
     """Read state.json, apply `change(fresh)` on top of it and write it back, all under the run's lock,
     so a command that took a long time cannot overwrite what another command saved meanwhile."""
     with locked(run):
-        fresh = load_state(run)
+        fresh = reconcile(run)
         state = {**fresh, **change(fresh)}
         _write_state(run, state)
     return state
+
+
+def reconcile(run: Path) -> State:
+    """Replay committed journal transitions exactly once after an interrupted state write."""
+    with locked(run):
+        state = load_state(run)
+        fresh = state
+        for message in read_messages(run):
+            if message["seq"] > fresh.get("journal_seq", 0) and "state_update" in message:
+                fresh = {**fresh, **message["state_update"], "journal_seq": message["seq"]}
+        if fresh != state:
+            _write_state(run, fresh)
+        return fresh
 
 
 def verify_integrity(run: Path) -> Optional[str]:
@@ -151,8 +174,10 @@ def append_message(
     kind: str = "message",
     meta: Optional[Dict[str, Any]] = None,
     sealed: bool = False,
+    change: Optional[Callable[[State, int], Dict[str, Any]]] = None,
 ) -> Message:
     with locked(run):
+        fresh = reconcile(run) if change is not None else None
         message: Message = {
             "seq": len(read_messages(run)) + 1,
             "ts": now_iso(),
@@ -164,6 +189,8 @@ def append_message(
         }
         if sealed:
             message["sealed_text"] = _seal(text)
+        if change is not None and fresh is not None:
+            message["state_update"] = change(fresh, message["seq"])
         record = (json.dumps(message, ensure_ascii=False) + "\n").encode("utf-8")
         log = run / MESSAGES_FILE
         so_far = log.read_bytes() if log.is_file() else b""
@@ -173,6 +200,8 @@ def append_message(
         with (run / TRANSCRIPT_FILE).open("a", encoding="utf-8") as fh:
             fh.write(_render(message))
         store.reseal(run)
+        if fresh is not None:
+            _write_state(run, {**fresh, **message["state_update"], "journal_seq": message["seq"]})
     return {**message, "text": text}
 
 

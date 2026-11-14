@@ -42,6 +42,9 @@ def observed(state: State, messages: List[Message], current: str, actor: str, fo
     `force` adds the actor even when the fingerprint was already recorded, for a peer write turn whose
     change another command happened to see first.
     """
+    pending = state.get("pending_turn") or {}
+    if pending.get("write") and actor == state["host"]:
+        actor = state["peer"]
     seen = state.get("seen_fingerprint")
     moved = seen is not None and seen != current
     if not moved and not force:

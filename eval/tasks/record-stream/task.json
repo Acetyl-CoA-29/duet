@@ -1,0 +1,4 @@
+{
+  "accept": "python3 -m pytest -q -p no:cacheprovider tests",
+  "protected": ["tests"]
+}

@@ -1,0 +1,5 @@
+{
+  "accept": "python3 -m pytest -q -p no:cacheprovider tests",
+  "protected": ["tests"],
+  "trap": "Composite continuation, arrival watermark, query binding, and an export call site using the legacy store helper"
+}

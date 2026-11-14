@@ -27,4 +27,6 @@ if "-o" in argv and not os.environ.get("FAKE_NO_LAST_FILE"):
     with open(argv[argv.index("-o") + 1], "w", encoding="utf-8") as fh:
         fh.write(reply)
 print(json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": reply}}))
-print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 100, "output_tokens": 7}}))
+# Like the real client, the usage on turn.completed is the thread's running total, not this turn's.
+print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": int(os.environ.get("FAKE_TOKENS_IN", "100")),
+                                                      "output_tokens": int(os.environ.get("FAKE_TOKENS_OUT", "7"))}}))

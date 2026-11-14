@@ -90,7 +90,9 @@ def _forward_refusal(state: State, messages: List[Message], here: str, target: s
     if target == BUILD and here in (FRAME, PROPOSE) and not skip:
         return ("no build before the blind proposal round and a joint plan (or the run must have been "
                 "started with --skip-proposals)")
-    if target == BUILD and here == PLAN and not skip:
+    replanned = bool(_last_replan(messages) or state.get("replan_seq"))
+    if target == BUILD and here == PLAN and (not skip or replanned):
+        # --skip-proposals waives the first plan only: a plan reopened with --replan needs both to agree.
         return _plan_refusal(state, messages)
     if target == REVIEW and here != BUILD:
         return "review follows build: record or run a build turn first"

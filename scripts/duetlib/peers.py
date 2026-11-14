@@ -7,6 +7,7 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -16,6 +17,7 @@ from .gates import stop_group
 DEFAULT_TIMEOUT_SECONDS = 2400
 ERROR_TAIL_CHARS = 1500
 KILL_GRACE_SECONDS = 5
+SNAPSHOT_ENV = "DUET_SNAPSHOT"
 BIN_ENV = {"codex": "DUET_CODEX_BIN", "claude": "DUET_CLAUDE_BIN"}
 OTHER_LAB_SECRETS = {
     "codex": ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"),
@@ -80,6 +82,18 @@ def _codex_command(session: Optional[str], write: bool, model: Optional[str], ef
     return command + ["-"]
 
 
+def enforces_read_only(peer: str) -> bool:
+    """True when the peer's own client refuses writes at the operating-system level on a read-only turn,
+    so the runner need not copy the workspace first (it still compares before and after).
+
+    Only the real Codex client qualifies: its `read-only` sandbox confines every command the model runs.
+    A substituted binary (DUET_CODEX_BIN) promises nothing, and Claude's read-only turns rest on settings
+    or plan mode. DUET_SNAPSHOT=always keeps the copy regardless."""
+    if os.environ.get(SNAPSHOT_ENV, "").strip().lower() == "always":
+        return False
+    return peer == "codex" and not os.environ.get(BIN_ENV["codex"])
+
+
 def claude_uses_plan_mode(write: bool) -> bool:
     """Plan mode is the read-only guard only where Claude's own sandbox cannot run (inside a Codex sandbox)."""
     return not write and host_is_sandboxed()
@@ -141,11 +155,23 @@ def usable_session(value: Any) -> bool:
     return isinstance(value, str) and bool(SESSION_RE.match(value))
 
 
+def _token_usage(raw: Any) -> Dict[str, Any]:
+    data = raw if isinstance(raw, dict) else {}
+    return {"input_tokens": _count(data.get("input_tokens")),
+            "output_tokens": _count(data.get("output_tokens"))}
+
+
 def _parse_codex(events: str, last: Path) -> PeerResult:
     session: Optional[str] = None
     replies: List[str] = []
     usage: Dict[str, Any] = {}
-    for line in events.splitlines():
+    completed = False
+    error = "the peer stream ended without a completed turn"
+    # JSONL uses LF, not the Unicode separators which are legal inside JSON strings.
+    for line in events.split("\n"):
+        if not line.strip():
+            continue
+        completed = False
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
@@ -154,16 +180,21 @@ def _parse_codex(events: str, last: Path) -> PeerResult:
             continue
         if event.get("type") == "thread.started":
             session = event.get("thread_id") or session
-        if event.get("type") == "turn.completed" and isinstance(event.get("usage"), dict):
-            raw = event["usage"]
-            usage = {"input_tokens": _count(raw.get("input_tokens")),
-                     "output_tokens": _count(raw.get("output_tokens"))}
+        completed = event.get("type") == "turn.completed"
+        if event.get("type") in ("turn.completed", "turn.failed") and isinstance(event.get("usage"), dict):
+            usage = _token_usage(event["usage"])
+        if event.get("type") == "turn.failed":
+            detail = event.get("error")
+            if isinstance(detail, dict) and isinstance(detail.get("message"), str):
+                error = "the peer turn failed: " + detail["message"]
         item = event.get("item")
         if not isinstance(item, dict):
             continue
         if (event.get("type") == "item.completed" and item.get("type") == "agent_message"
                 and isinstance(item.get("text"), str)):
             replies.append(item["text"])
+    if not completed:
+        return PeerResult(False, "", session, error, usage)
     try:
         reply = last.read_text(encoding="utf-8", errors="replace") if last.is_file() else ""
     except OSError:
@@ -176,27 +207,39 @@ def _parse_codex(events: str, last: Path) -> PeerResult:
 
 def _parse_claude(output: str) -> PeerResult:
     data: Any = None
-    candidates = [output.strip()] + list(reversed(output.strip().splitlines()))
+    candidates = [output.strip()] + list(reversed(output.strip().split("\n")))
     for candidate in candidates:
         try:
             data = json.loads(candidate)
         except json.JSONDecodeError:
             continue
-        if isinstance(data, dict) and "result" in data:
+        if isinstance(data, dict) and ("result" in data or data.get("type") == "result"):
             break
     else:
         return PeerResult(False, "", None, "the peer's output was not JSON")
     if not isinstance(data, dict):
         return PeerResult(False, "", None, "the peer's output was not a JSON object")
     reply = data["result"].strip() if isinstance(data.get("result"), str) else ""
-    if data.get("is_error") or not reply:
-        return PeerResult(False, "", data.get("session_id"), reply or "the peer reported an error")
-    raw = data.get("usage") if isinstance(data.get("usage"), dict) else {}
     cost = data.get("total_cost_usd")
-    spent = float(cost) if isinstance(cost, (int, float)) and not isinstance(cost, bool) else 0.0
-    usage = {"input_tokens": _count(raw.get("input_tokens")), "output_tokens": _count(raw.get("output_tokens")),
-             "cost_usd": spent if 0.0 <= spent < float("inf") else 0.0}
+    valid_cost = isinstance(cost, (int, float)) and not isinstance(cost, bool) and cost >= 0
+    # A huge JSON integer must not crash recovery or turn a reported bill into zero spend.
+    spent = float(min(cost, sys.float_info.max)) if valid_cost else 0.0
+    usage = {**_token_usage(data.get("usage")), "cost_usd": spent}
+    if data.get("is_error") or not reply:
+        return PeerResult(False, "", data.get("session_id"), reply or "the peer reported an error", usage)
     return PeerResult(True, reply, data.get("session_id"), usage=usage)
+
+
+def saved_result(peer: str, turn_dir: Path) -> PeerResult:
+    """Parse a saved receipt, including usage from a process interrupted before it was journaled."""
+    try:
+        output = (turn_dir / "stdout.txt").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        output = ""
+    try:
+        return _parse_codex(output, turn_dir / "last.txt") if peer == "codex" else _parse_claude(output)
+    except (ValueError, OverflowError, RecursionError):
+        return PeerResult(False, "", None, "the peer's saved output could not be parsed")
 
 
 def _drop_empty_client_folder(workspace: Path) -> None:
@@ -268,17 +311,16 @@ def run_turn(
         return PeerResult(False, "", session, f"could not start {command[0]}: {exc}")
     if peer == "claude" and not had_client_folder:
         _drop_empty_client_folder(workspace)
-    output = out_path.read_text(encoding="utf-8", errors="replace")
-    parsed = _parse_codex(output, last) if peer == "codex" else _parse_claude(output)
+    parsed = saved_result(peer, turn_dir)
     if parsed.session is not None and not usable_session(parsed.session):
-        return PeerResult(False, "", session, BAD_SESSION)
+        return PeerResult(False, "", session, BAD_SESSION, parsed.usage)
     kept = parsed.session or session
     if timed_out:
-        return PeerResult(False, "", kept, f"the peer timed out after {timeout}s; its work may be partly done")
+        return PeerResult(False, "", kept, f"the peer timed out after {timeout}s; its work may be partly done", parsed.usage)
     if code != 0:
         tail = err_path.read_text(encoding="utf-8", errors="replace")[-ERROR_TAIL_CHARS:].strip()
-        return PeerResult(False, "", kept, f"the peer exited with code {code}: {tail or parsed.error}")
+        return PeerResult(False, "", kept, f"the peer exited with code {code}: {tail or parsed.error}", parsed.usage)
     if parsed.ok and not kept:
         return PeerResult(False, "", None, "the peer replied without a session id, so the conversation "
-                                           "could not be continued; its reply was discarded")
+                                           "could not be continued; its reply was discarded", parsed.usage)
     return PeerResult(parsed.ok, parsed.reply, kept, parsed.error, parsed.usage)

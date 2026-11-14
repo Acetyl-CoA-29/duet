@@ -1053,8 +1053,24 @@ def test_snapshot_falls_back_to_a_plain_copy_and_keeps_links(tmp_path, monkeypat
     (ws / "a.txt" / "inner").write_text("x")
     after = gates.manifest(ws)
     changed = gates.changed_files(files, after)
-    assert snapshot.restore(ws, tmp_path / "snap", changed, files) == []
+    assert snapshot.restore(ws, tmp_path / "snap", changed, files, aside=tmp_path / "aside") == []
     assert gates.manifest(ws) == files and (ws / "link").is_symlink()
+    assert (tmp_path / "aside" / "a.txt" / "inner").read_text() == "x"  # the folder that stood there is kept whole
+
+
+def test_restore_without_somewhere_to_keep_a_folder_refuses_to_delete_it(tmp_path):
+    ws = tmp_path / "w"
+    ws.mkdir()
+    (ws / "a.txt").write_text("a")
+    files = gates.manifest(ws)
+    assert snapshot.take(ws, files, tmp_path / "snap")
+    (ws / "a.txt").unlink()
+    (ws / "a.txt" / "__pycache__").mkdir(parents=True)
+    (ws / "a.txt" / "__pycache__" / "inner.pyc").write_text("x")  # not in any manifest, so saved nowhere else
+    changed = gates.changed_files(files, gates.manifest(ws))
+    assert snapshot.restore(ws, tmp_path / "snap", changed, files) == ["a.txt"]
+    assert (ws / "a.txt" / "__pycache__" / "inner.pyc").read_text() == "x"
+    assert (tmp_path / snapshot.KEPT_NAME / "a.txt").read_text() == "a"
 
 
 def test_snapshot_ceiling_setting(monkeypatch):
@@ -1223,7 +1239,9 @@ def test_debate_is_an_alias_for_plan(env, capsys):
     assert cli.main(["peer", "--run", str(run), "--phase", "debate"]) == 0
     assert [m["phase"] for m in st.read_messages(run)[-2:]] == ["plan", "plan"]
     prompt = calls(env)[-1]["stdin"]
-    assert "Phase: plan." in prompt and "strongest objection" in prompt and "ONE primary design" in prompt
+    assert "Phase: plan." in prompt and "consequential differences" in prompt
+    assert "Combine compatible parts" in prompt and "do not invent disagreement" in prompt
+    assert "strongest objection" not in prompt and "ONE primary design" not in prompt
     assert "experiment" in prompt and "ordered tasks" in prompt and "VERDICT:" in prompt
     assert say(env, run, "Building.", "--phase", "build") == 0
 
@@ -1556,8 +1574,8 @@ def test_check_result_is_dropped_when_the_command_was_replaced_meanwhile(env, ca
     run = start(env, capsys, "--accept", "true")
     real = gates.run_check
 
-    def swapped(state, timeout):
-        result = real(state, timeout)
+    def swapped(state, timeout, **kwargs):
+        result = real(state, timeout, **kwargs)
         assert cli.main(["accept", "--run", str(run), "--cmd", "false"]) == 0
         return result
 
@@ -1647,7 +1665,12 @@ def test_finish_is_refused_outside_build_and_review(env, capsys):
     report = status(run, capsys)
     assert report["ready_to_finish"] is False and "the run is in plan" in " ".join(report["blocking"])
     assert cli.main(["finish", "--run", str(run)]) == cli.EXIT_NOT_DONE
-    assert say(env, run, "Back to building.", "--phase", "build") == 0  # --skip-proposals run: no plan verdicts
+    assert say(env, run, "Back to building.", "--phase", "build") == cli.EXIT_ORDER  # a replan needs agreement
+    assert say(env, run, "New design.", "--phase", "plan", "--verdict", "approve") == 0
+    assert cli.main(["peer", "--run", str(run), "--phase", "plan"]) == 0
+    assert say(env, run, "Back to building.", "--phase", "build") == 0
+    cli.main(["check", "--run", str(run)])
+    approve_both(env, run)
     assert cli.main(["finish", "--run", str(run)]) == 0
 
 
@@ -1846,6 +1869,69 @@ def test_preamble_does_not_promise_a_blind_round_that_was_skipped(env, capsys):
     assert "propose: not used in this run" in prompt and "test fixture" in prompt
 
 
+def test_frame_prompt_checks_acceptance_coverage_before_it_locks(env, capsys):
+    run = start(env, capsys, "--accept", "true", proposals=True)
+    assert cli.main(["peer", "--run", str(run), "--phase", "frame"]) == 0
+    prompt = calls(env)[-1]["stdin"]
+    assert "map each requirement to observable checks" in prompt
+    assert "plausible wrong implementation" in prompt and "still pass it" in prompt
+    assert "baseline with check during frame, before the command locks" in prompt
+    assert "If an acceptance command is set" in prompt
+    assert "refactor may start green" in prompt
+    assert "separately check the requested structural or performance change" in prompt
+    assert "it should fail" not in prompt.lower()
+
+
+def test_frame_prompt_handles_waived_acceptance_without_a_baseline_command():
+    from duetlib import prompts
+    state = {"peer": "codex", "host": "claude", "accept_cmd": None, "accept_waived": "prose task"}
+    prompt = prompts.build_prompt(state, "Revise the guide.", "frame", [], False, False)
+    assert "no command (waived by the user: prose task)" in prompt
+    assert "If an acceptance command is set" in prompt
+    assert "If acceptance is waived, agree on evidence that will establish success instead of running check" in prompt
+
+
+def test_propose_prompt_derives_independent_cases_from_requirements(env, capsys):
+    run = start(env, capsys, "--accept", "true", proposals=True)
+    assert say(env, run, "HOST-SEALED-DESIGN", "--phase", "propose") == 0
+    assert cli.main(["peer", "--run", str(run), "--phase", "propose"]) == 0
+    prompt = calls(env)[-1]["stdin"]
+    assert "Inspect repository constraints" in prompt
+    assert "three independent input/expected-output cases derived from the requirements" in prompt
+    assert "your riskiest assumption" in prompt
+    assert "HOST-SEALED-DESIGN" not in prompt
+
+
+@pytest.mark.parametrize("first", [True, False])
+def test_plan_prompt_requires_implementation_readiness_and_independent_tests(first):
+    from duetlib import prompts
+    state = {"peer": "codex", "host": "claude", "accept_cmd": "python3 -m pytest -q"}
+    prompt = prompts.build_prompt(state, "Build a greeter.", "plan", [], False, first)
+    assert "APPROVE means ready to implement" in prompt
+    assert "whoever does not implement a piece writes its tests in a build turn" in prompt
+    assert "input/expected-output cases in the blind proposals" in prompt
+    assert "Explain any changed expectations" in prompt
+    assert "review must note when a planned split did not happen" in prompt
+    assert "no material disagreement" in prompt and "evidence that would decide them" in prompt
+    assert "you would ship it" not in prompt
+
+
+@pytest.mark.parametrize("first", [True, False])
+def test_review_prompt_requires_observed_evidence_and_regressions(first):
+    from duetlib import prompts
+    state = {"peer": "claude", "host": "codex", "accept_cmd": "python3 -m pytest -q"}
+    prompt = prompts.build_prompt(state, "Build a greeter.", "review", [], False, first)
+    assert "highest-risk uncovered requirement" in prompt
+    assert "Report observed results separately from reasoning" in prompt
+    assert "withhold approval until results are available" in prompt
+    assert "Keep accepted counterexamples as regression tests in a subsequent build turn" in prompt
+    assert "planned test/implementation split did not happen" in prompt
+    assert "acceptance check pass on those files (unless explicitly waived)" in prompt
+    assert "and testing an uncovered case" in prompt
+    assert "run or reason through" not in prompt
+    assert "Do not edit, create or delete source files" in prompt
+
+
 def test_review_turns_restate_the_goal_and_the_ground_rules(env, capsys):
     run = start(env, capsys, "--accept", "true")
     nonce = st.load_state(run)["nonce"]
@@ -1869,6 +1955,10 @@ def test_turn_notes_say_what_each_kind_of_turn_may_do(env, capsys):
     assert cli.main(["peer", "--run", str(run), "--phase", "build", "--write"]) == 0
     driver = calls(env)[-1]["stdin"]
     assert "Do the one task Claude named for this turn and nothing more" in driver
+    assert "If no task was named" in driver and "ask before editing" in driver
+    assert "approved plan is ambiguous, ask instead of guessing" in driver
+    assert "changed files, checks run with their results, and remaining gaps" in driver
+    assert "do the next task" not in driver
     assert "turn with write access is not counted" in calls(env)[0]["stdin"]
 
 
@@ -1895,3 +1985,267 @@ def test_message_file_in_another_encoding_is_refused_plainly(env, capsys):
     marked.write_bytes(b"\xef\xbb\xbfHello.")
     assert cli.main(["say", "--run", str(run), "--phase", "frame", "--file", str(marked)]) == 0
     assert st.read_messages(run)[-1]["text"] == "Hello."
+
+
+# --- 1.7 review round: restore never deletes what it did not save ---------------------------------
+
+def _violation(env, capsys, monkeypatch, script, *init_extra):
+    """One read-only review turn with a meddling stand-in peer on a workspace holding pkg/a.py."""
+    (env["ws"] / "pkg").mkdir()
+    (env["ws"] / "pkg" / "a.py").write_text("A = 1\n")
+    run = start(env, capsys, "--accept", "true", *init_extra)
+    enter_build(env, run)
+    _meddling_peer(env, monkeypatch, script)
+    code = cli.main(["peer", "--run", str(run), "--phase", "review"])
+    return run, code, st.read_messages(run)[-1]["text"]
+
+
+def test_folder_that_replaced_a_file_is_kept_whole_before_the_file_returns(env, capsys, monkeypatch):
+    script = "rm app.py && mkdir -p app.py/__pycache__ && echo precious > app.py/__pycache__/local.pyc"
+    run, code, text = _violation(env, capsys, monkeypatch, script)
+    assert code == cli.EXIT_READONLY_BROKEN and "put back exactly" in text
+    assert (env["ws"] / "app.py").read_text() == "print('hi')\n"
+    kept = run / "turns" / "001" / "readonly-violation" / "folders" / "app.py" / "__pycache__" / "local.pyc"
+    assert kept.read_text() == "precious\n"
+
+
+def test_folder_that_cannot_be_kept_is_not_removed(env, capsys, monkeypatch):
+    monkeypatch.setattr(snapshot, "preserve_folder", lambda source, dest: False)
+    script = "rm app.py && mkdir -p app.py/__pycache__ && echo precious > app.py/__pycache__/local.pyc"
+    run, code, text = _violation(env, capsys, monkeypatch, script)
+    assert code == cli.EXIT_READONLY_BROKEN
+    assert (env["ws"] / "app.py" / "__pycache__" / "local.pyc").read_text() == "precious\n"
+    assert "still in place" in text and "could not be saved whole first, so it was not removed" in text
+    kept = run / "turns" / "001" / snapshot.KEPT_NAME
+    assert str(kept) in text and (kept / "app.py").read_text() == "print('hi')\n"
+    assert st.load_state(run)["writers"] == ["codex"]
+
+
+def test_preserve_folder_copies_across_volumes_and_never_overwrites(tmp_path, monkeypatch):
+    import os
+    source = tmp_path / "src"
+    (source / "deep").mkdir(parents=True)
+    (source / "deep" / "f.txt").write_text("x")
+    (source / "link").symlink_to("deep/f.txt")
+    monkeypatch.setattr(os, "rename", lambda *a: (_ for _ in ()).throw(OSError("cross-device link")))
+    assert snapshot.preserve_folder(source, tmp_path / "aside" / "src") is True
+    assert (tmp_path / "aside" / "src" / "deep" / "f.txt").read_text() == "x"
+    assert (tmp_path / "aside" / "src" / "link").is_symlink() and source.is_dir()  # the caller removes the source
+    assert snapshot.preserve_folder(source, tmp_path / "aside" / "src") is False  # something is already there
+    assert (tmp_path / "aside" / "src" / "deep" / "f.txt").read_text() == "x"
+
+
+# --- 1.7 review round: a folder made inaccessible does not wedge the run --------------------------
+
+needs_permissions = pytest.mark.skipif(__import__("os").geteuid() == 0, reason="root ignores permission bits")
+
+
+@needs_permissions
+@pytest.mark.parametrize("git", [False, True])
+def test_manifest_lists_an_unreadable_folder_instead_of_failing(env, git):
+    ws = env["ws"]
+    (ws / "pkg" / "sub").mkdir(parents=True)
+    (ws / "pkg" / "sub" / "a.py").write_text("A = 1\n")
+    if git:
+        _git_workspace(env)
+    before = gates.manifest(ws)
+    (ws / "pkg").chmod(0)
+    try:
+        after = gates.manifest(ws)
+        assert gates.closed_folders(ws, list(before)) == ["pkg/"]
+    finally:
+        (ws / "pkg").chmod(0o755)
+    assert after["pkg/"] != before["pkg/"] and after["pkg/"] != gates.MISSING
+    assert after.get("pkg/sub/a.py", gates.MISSING) == gates.MISSING
+    assert gates.manifest(ws) == before
+
+
+@needs_permissions
+def test_unreadable_workspace_names_the_way_out(env, capsys):
+    run = start(env, capsys, "--accept", "true")
+    env["ws"].chmod(0)
+    try:
+        assert cli.main(["status", "--run", str(run)]) == cli.EXIT_USAGE
+    finally:
+        env["ws"].chmod(0o755)
+    assert "chmod u+rwx" in capsys.readouterr().err
+
+
+@needs_permissions
+@pytest.mark.parametrize("script", ["chmod 000 pkg", "echo planted > pkg/new.py && rm pkg/a.py && chmod 000 pkg",
+                                    "mkdir pkg/deep && echo d > pkg/deep/d.py && chmod 000 pkg/deep && chmod 000 pkg"])
+def test_folder_closed_during_a_read_only_turn_is_reopened_and_put_back(env, capsys, monkeypatch, script):
+    try:
+        run, code, text = _violation(env, capsys, monkeypatch, script)
+        assert code == cli.EXIT_READONLY_BROKEN and "put back exactly" in text, text
+        assert (env["ws"] / "pkg").stat().st_mode & 0o777 == 0o755
+        assert sorted(p.name for p in (env["ws"] / "pkg").iterdir()) == ["a.py"]
+        assert (env["ws"] / "pkg" / "a.py").read_text() == "A = 1\n"
+        state = st.load_state(run)
+        assert state["pending_turn"] is None and state.get("writers", []) == []
+        assert cli.main(["status", "--run", str(run)]) == 0
+        if "planted" in script:
+            saved = run / "turns" / "001" / "readonly-violation" / "files" / "pkg" / "new.py"
+            assert saved.read_text() == "planted\n"
+    finally:
+        for folder in (env["ws"] / "pkg", env["ws"] / "pkg" / "deep"):
+            if folder.is_dir():
+                folder.chmod(0o755)
+
+
+@needs_permissions
+def test_closed_folder_without_a_snapshot_is_reported_with_the_command_to_run(env, capsys, monkeypatch):
+    monkeypatch.setenv("DUET_SNAPSHOT_MAX_MB", "0")
+    try:
+        run, code, text = _violation(env, capsys, monkeypatch, "chmod 000 pkg")
+        assert code == cli.EXIT_READONLY_BROKEN
+        assert "still in place" in text and f"chmod u+rwx '{env['ws'] / 'pkg'}'" in text
+        capsys.readouterr()
+        assert cli.main(["status", "--run", str(run)]) == 0  # later commands are not wedged
+        assert json.loads(capsys.readouterr().out)["writers"] == ["codex"]
+        assert cli.main(["accept", "--run", str(run), "--cmd", "true", "--by-user", "ok"]) == 0
+    finally:
+        (env["ws"] / "pkg").chmod(0o755)
+
+
+# --- 1.7 review round: a replan always needs fresh agreement --------------------------------------
+
+def test_skip_proposals_does_not_waive_agreement_after_a_replan(env, capsys):
+    run = start(env, capsys, "--accept", "true")
+    assert say(env, run, "No plan needed at first.", "--phase", "plan") == 0
+    assert say(env, run, "Building.", "--phase", "build") == 0  # the initial entry is what the flag waives
+    assert say(env, run, "Wrong design.", "--phase", "plan", "--replan", "no prefix scan", "--verdict", "revise") == 0
+    assert say(env, run, "Building again.", "--phase", "build") == cli.EXIT_ORDER
+    assert "both models have spoken in plan" in capsys.readouterr().err
+    assert status(run, capsys)["allowed_next"] == ["plan"]
+    assert cli.main(["peer", "--run", str(run), "--phase", "build", "--write"]) == cli.EXIT_ORDER
+    assert cli.main(["peer", "--run", str(run), "--phase", "plan"]) == 0  # the peer approves
+    assert say(env, run, "Building again.", "--phase", "build") == cli.EXIT_ORDER  # the host said revise
+    assert "not yet: claude" in capsys.readouterr().err
+    assert say(env, run, "Agreed.", "--phase", "plan", "--verdict", "approve") == 0
+    assert say(env, run, "Building again.", "--phase", "build") == 0
+
+
+# --- 1.7 review round: Codex token totals are running totals --------------------------------------
+
+def _usage(run):
+    used = st.load_state(run)["peer_usage"]
+    return used["input_tokens"], used["output_tokens"]
+
+
+def test_codex_running_totals_are_not_added_twice(env, capsys, monkeypatch):
+    run = start(env, capsys, "--accept", "true")
+    monkeypatch.setenv("FAKE_TOKENS_IN", "100")
+    monkeypatch.setenv("FAKE_TOKENS_OUT", "10")
+    assert cli.main(["peer", "--run", str(run), "--phase", "frame"]) == 0
+    assert _usage(run) == (100, 10)
+    monkeypatch.setenv("FAKE_TOKENS_IN", "300")
+    monkeypatch.setenv("FAKE_TOKENS_OUT", "25")
+    assert cli.main(["peer", "--run", str(run), "--phase", "frame"]) == 0
+    assert _usage(run) == (300, 25)  # not 400 and 35
+    monkeypatch.setenv("FAKE_EXIT", "3")  # a failed turn reports nothing: the baseline stands
+    assert cli.main(["peer", "--run", str(run), "--phase", "frame"]) == cli.EXIT_PEER_FAILED
+    monkeypatch.delenv("FAKE_EXIT")
+    assert _usage(run) == (300, 25)
+    monkeypatch.setenv("FAKE_TOKENS_IN", "450")
+    assert cli.main(["peer", "--run", str(run), "--phase", "frame"]) == 0
+    assert _usage(run) == (450, 25)
+    assert st.load_state(run)["peer_usage_base"] == {"session": "sess-123", "input_tokens": 450, "output_tokens": 25}
+
+
+def test_new_codex_session_starts_a_new_baseline(env, capsys, monkeypatch):
+    run = start(env, capsys, "--accept", "true")
+    monkeypatch.setenv("FAKE_TOKENS_IN", "300")
+    assert cli.main(["peer", "--run", str(run), "--phase", "frame"]) == 0
+    monkeypatch.setenv("FAKE_SESSION", "sess-456")
+    monkeypatch.setenv("FAKE_TOKENS_IN", "80")
+    monkeypatch.setenv("FAKE_TOKENS_OUT", "5")
+    assert cli.main(["peer", "--run", str(run), "--phase", "frame", "--new-session"]) == 0
+    assert _usage(run) == (380, 12)
+    monkeypatch.setenv("FAKE_TOKENS_IN", "200")
+    monkeypatch.setenv("FAKE_TOKENS_OUT", "9")
+    assert cli.main(["peer", "--run", str(run), "--phase", "frame"]) == 0
+    assert _usage(run) == (500, 16)
+
+
+def test_usage_survives_journal_replay_exactly_once(env, capsys, monkeypatch):
+    run = start(env, capsys, "--accept", "true")
+    assert cli.main(["peer", "--run", str(run), "--phase", "frame"]) == 0
+    monkeypatch.setenv("FAKE_TOKENS_IN", "300")
+    assert cli.main(["peer", "--run", str(run), "--phase", "frame"]) == 0
+    committed = st.load_state(run)
+    lost = {**committed, "journal_seq": 1, "peer_usage": {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0},
+            "peer_usage_base": None}
+    st.save_state(run, lost)  # as if both receipts' state writes had been lost after their journal entries
+    assert st.reconcile(run)["peer_usage"] == committed["peer_usage"]
+    assert st.reconcile(run)["peer_usage"] == committed["peer_usage"] and _usage(run) == (300, 7)
+    assert st.load_state(run)["peer_usage_base"] == committed["peer_usage_base"]
+
+
+def test_claude_usage_stays_additive_and_status_says_what_the_figures_mean(env, capsys):
+    run = start(env, capsys, "--accept", "true", "--peer", "claude")
+    assert cli.main(["peer", "--run", str(run), "--phase", "frame"]) == 0
+    assert cli.main(["peer", "--run", str(run), "--phase", "frame"]) == 0
+    used = st.load_state(run)["peer_usage"]
+    assert (used["input_tokens"], used["output_tokens"], used["cost_usd"]) == (100, 10, 0.5)
+    assert "each report covers one turn" in status(run, capsys)["peer_usage_note"]
+    codex_run = start(env, capsys, "--accept", "true")
+    assert "running total per session" in status(codex_run, capsys)["peer_usage_note"]
+
+
+# --- 1.7 review round: large workspaces are scanned once per command ------------------------------
+
+def _count_scans(monkeypatch):
+    real, scans = gates.manifest, []
+    monkeypatch.setattr(gates, "manifest", lambda workspace: scans.append(1) or real(workspace))
+    return scans
+
+
+def test_status_and_check_do_not_rescan_the_workspace(env, capsys, monkeypatch):
+    run = start(env, capsys, "--accept", "true")
+    scans = _count_scans(monkeypatch)
+    assert cli.main(["status", "--run", str(run)]) == 0
+    assert len(scans) == 1
+    del scans[:]
+    assert cli.main(["check", "--run", str(run)]) == 0
+    assert len(scans) == 2  # before and after the command, nothing else
+    del scans[:]
+    enter_build(env, run)
+    assert len(scans) == 1
+
+
+def test_check_by_products_become_the_files_last_seen(env, capsys):
+    run = start(env, capsys, "--accept", "echo out > report.txt")
+    assert cli.main(["check", "--run", str(run)]) == 0
+    state = st.load_state(run)
+    assert state["last_check"]["stable"] is False and state["seen_fingerprint"] == gates.fingerprint(env["ws"])
+    assert state.get("writers", []) == []
+
+
+def test_only_the_real_codex_client_counts_as_enforcing_read_only(monkeypatch):
+    from duetlib import peers
+    monkeypatch.setenv("DUET_CODEX_BIN", "/tmp/stand-in")
+    assert peers.enforces_read_only("codex") is False  # a substituted binary promises nothing
+    monkeypatch.delenv("DUET_CODEX_BIN")
+    monkeypatch.delenv("DUET_SNAPSHOT", raising=False)
+    assert peers.enforces_read_only("codex") is True and peers.enforces_read_only("claude") is False
+    monkeypatch.setenv("DUET_SNAPSHOT", "always")
+    assert peers.enforces_read_only("codex") is False
+
+
+def test_no_copy_is_taken_when_the_peers_sandbox_enforces_read_only_but_changes_are_still_caught(env, capsys, monkeypatch):
+    from duetlib import peers
+    run = start(env, capsys, "--accept", "true")
+    enter_build(env, run)
+    monkeypatch.setattr(peers, "enforces_read_only", lambda peer: True)
+    monkeypatch.setattr(snapshot, "take", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no snapshot")))
+    assert cli.main(["peer", "--run", str(run), "--phase", "review"]) == 0
+    assert st.read_messages(run)[-1]["meta"]["verdict"] == "approve"
+    monkeypatch.setenv("FAKE_WRITE_FILE", str(env["ws"] / "app.py"))
+    assert cli.main(["peer", "--run", str(run), "--phase", "review"]) == cli.EXIT_READONLY_BROKEN
+    messages = st.read_messages(run)
+    assert messages[-2]["meta"]["verdict"] is None and messages[-2]["meta"]["verdict_ignored"] == "approve"
+    assert "peer's own sandbox refuses writes" in messages[-1]["text"] and "still in place" in messages[-1]["text"]
+    assert (env["ws"] / "app.py").read_text() == "print('hi')\nedit\n"
+    assert st.load_state(run)["writers"] == ["codex"]
+    assert (run / "turns" / "002" / "readonly-violation" / "changes.txt").read_text() == "modified app.py\n"

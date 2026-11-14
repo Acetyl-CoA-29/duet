@@ -11,7 +11,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from .state import RUN_ROOT, Message, State
+from .state import RUN_ROOT, DuetError, Message, State
 
 # Folders that tools fill as a side effect of running code and nobody writes by hand. They are left out
 # of the fingerprint wherever they sit. Anything else (build, dist, coverage, venv ...) counts as source
@@ -23,8 +23,7 @@ CACHE_DIRS = frozenset({
 SKIP_DIRS = CACHE_DIRS | {".git"}
 EXCLUDE_FILE = ".git/info/exclude"  # fingerprinted so a turn cannot hide files by listing them there
 MISSING = "unreadable-or-deleted"
-DIR_SUFFIX = "/"  # an empty folder is listed under its name with this suffix
-MAX_NESTED_REPOS = 8
+DIR_SUFFIX = "/"  # directories are listed under their name with this suffix
 GIT_TIMEOUT_SECONDS = 60
 STALL_AFTER = 3
 HASH_CHUNK_BYTES = 1 << 16
@@ -40,7 +39,6 @@ CHECK_TIMEOUT_SECONDS = 1800
 OUTPUT_TAIL_LINES = 80
 OUTPUT_HEAD_LINES = 25
 OUTPUT_TAIL_CHARS = 6000
-DIR_DIGEST = hashlib.sha256(b"dir").hexdigest()
 VERDICT_RE = re.compile(r"^[\s*_`#-]*VERDICT:\s*(APPROVE|REVISE)\b[\s*_`.]*$", re.IGNORECASE)
 FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 
@@ -106,43 +104,73 @@ def _is_cache(name: str) -> bool:
 
 
 def _real_dir(path: Path) -> bool:
-    return path.is_dir() and not path.is_symlink()
-
-
-def _has_entries(folder: Path) -> bool:
     try:
-        return any(True for _ in folder.iterdir())
+        return path.is_dir() and not path.is_symlink()
+    except OSError:  # a folder on the way cannot be searched: nothing can be said about what is behind it
+        return False
+
+
+def _listing(folder: str) -> Optional[List["os.DirEntry[str]"]]:
+    """The entries of one folder, or None when it cannot be read (no permission, or gone meanwhile)."""
+    try:
+        with os.scandir(folder) as entries:
+            return list(entries)
     except OSError:
-        return True
+        return None
+
+
+def _entry_is_dir(entry: "os.DirEntry[str]") -> bool:
+    try:
+        return entry.is_dir(follow_symlinks=False)
+    except OSError:
+        return False
+
+
+def _entry_is_file(entry: "os.DirEntry[str]") -> bool:
+    try:
+        return entry.is_symlink() or entry.is_file(follow_symlinks=False)
+    except OSError:
+        return False
 
 
 def _walk(root: Path, depth: int, pruned: frozenset = frozenset(), files: bool = True) -> List[str]:
     """Files, links and empty folders under root, skipping tool caches and .git. A nested repository is
-    listed by its own rules. With files=False only empty folders are returned (git lists the files)."""
+    listed by its own rules. With files=False only empty folders are returned (git lists the files).
+
+    A folder that cannot be read is listed as itself (name plus slash), so its changed permissions show
+    up as a change instead of stopping the scan."""
     found: List[str] = []
-    stack = [root]
+    base = str(root)
+    stack = [""]
     while stack:
-        folder = stack.pop()
-        for entry in sorted(folder.iterdir()):
-            rel = entry.relative_to(root).as_posix()
-            if _real_dir(entry):
-                if entry.name in SKIP_DIRS or rel in pruned or (folder == root and depth == 0 and entry.name == RUN_ROOT):
+        here = stack.pop()
+        entries = _listing(os.path.join(base, here) if here else base)
+        if entries is None:
+            if not here and depth == 0:
+                raise DuetError(f"the workspace folder cannot be read: {base}. Give yourself access again "
+                                f"(`chmod u+rwx {base}`) and repeat the command")
+            found.append(here + DIR_SUFFIX if here else "")  # "" names a nested repository's own folder
+            continue
+        if not entries and here:
+            found.append(here + DIR_SUFFIX)
+        for entry in entries:
+            rel = f"{here}/{entry.name}" if here else entry.name
+            if _entry_is_dir(entry):
+                if entry.name in SKIP_DIRS or rel in pruned or (not here and depth == 0 and entry.name == RUN_ROOT):
                     continue
-                if (entry / ".git").exists() or (entry / ".git").is_symlink():
-                    if files and depth < MAX_NESTED_REPOS:
-                        found += [f"{rel}/{inner}" for inner in _names(entry, depth + 1)]
-                elif not _has_entries(entry):
-                    found.append(rel + DIR_SUFFIX)
+                if os.path.lexists(os.path.join(entry.path, ".git")):
+                    if files:
+                        found += [f"{rel}/{inner}" for inner in _names(Path(entry.path), depth + 1)]
                 else:
-                    stack.append(entry)
-            elif files and (entry.is_symlink() or entry.is_file()) and not entry.name.endswith(".pyc"):
+                    stack.append(rel)
+            elif files and _entry_is_file(entry) and not entry.name.endswith(".pyc"):
                 found.append(rel)
     return found
 
 
 def _git_names(root: Path, depth: int) -> Optional[List[str]]:
     """Every tracked file, every untracked file git does not ignore (tool caches aside), the contents of
-    nested repositories and submodules, and empty folders outside ignored ones."""
+    nested repositories and submodules, and folders outside ignored ones."""
     tracked, untracked = _git_list(root, "-c"), _git_list(root, "-o")
     ignored = _git_list(root, "-o", "-i", "--directory")
     if tracked is None or untracked is None or ignored is None:
@@ -151,8 +179,7 @@ def _git_names(root: Path, depth: int) -> Optional[List[str]]:
     for name in tracked + [name for name in untracked if not _is_cache(name)]:
         if name.endswith("/") or _real_dir(root / name):  # a nested repository, or a file turned folder
             base = name.rstrip("/")
-            if depth < MAX_NESTED_REPOS:
-                names += [f"{base}/{inner}" for inner in _names(root / base, depth + 1)]
+            names += [f"{base}/{inner}" for inner in _names(root / base, depth + 1)]
         else:
             names.append(name)
     pruned = frozenset(name.rstrip("/") for name in ignored if name.endswith("/"))
@@ -170,7 +197,8 @@ def _link_above(workspace: Path, name: str, known: Dict[str, bool]) -> bool:
     if not parent:
         return False
     if parent not in known:
-        known[parent] = (workspace / parent).is_symlink() or _link_above(workspace, parent, known)
+        # os.path.islink answers False, without raising, when a folder on the way cannot be searched.
+        known[parent] = os.path.islink(os.path.join(str(workspace), parent)) or _link_above(workspace, parent, known)
     return known[parent]
 
 
@@ -190,9 +218,11 @@ def _entry_digest(path: Path, name: str) -> str:
     info = path.lstat()
     if stat.S_ISLNK(info.st_mode):
         return hashlib.sha256(b"link:" + os.fsencode(os.readlink(path))).hexdigest()
+    mode = f"{stat.S_IMODE(info.st_mode):04o}".encode("ascii")
+    if stat.S_ISDIR(info.st_mode):
+        return hashlib.sha256(b"dir:" + mode).hexdigest()
     if not stat.S_ISREG(info.st_mode):
         return hashlib.sha256(f"special:{stat.S_IFMT(info.st_mode)}".encode("ascii")).hexdigest()
-    mode = f"{stat.S_IMODE(info.st_mode):04o}".encode("ascii")
     if name == EXCLUDE_FILE:  # the runner's own `.duet/` line there is not a change
         return hashlib.sha256(_hash_file(path, skip_line=RUN_ROOT.encode("ascii") + b"/")).hexdigest()
     if info.st_size > HUGE_FILE_BYTES:
@@ -200,27 +230,41 @@ def _entry_digest(path: Path, name: str) -> str:
     return hashlib.sha256(mode + _hash_file(path)).hexdigest()
 
 
+def _ancestors(names: List[str]) -> List[str]:
+    """Every folder on the way to a listed name, as relative paths without the trailing slash."""
+    seen: set = set()
+    for name in names:
+        parent = os.path.dirname(name.rstrip("/"))
+        while parent and parent not in seen:
+            seen.add(parent)
+            parent = os.path.dirname(parent)
+    return sorted(seen)
+
+
+def _digest_or_missing(workspace: Path, name: str) -> str:
+    try:
+        return _entry_digest(workspace / name, name)
+    except OSError:
+        return MISSING
+
+
 def manifest(workspace: Path) -> Dict[str, str]:
-    """Digest of every source file by path, so a change can be named as well as detected. Empty folders
-    are listed with a trailing slash; a file reached only through a symbolic link counts as missing."""
-    names = _names(workspace)
+    """Digest of every source file by path, so a change can be named as well as detected. Folders
+    are listed with a trailing slash; a file reached only through a symbolic link counts as missing,
+    and so does anything behind a folder that cannot be searched (the folder itself is listed)."""
+    names = [name for name in _names(workspace) if name]
+    # Cover source ancestors (even when git ignores them), without adding folders that contain only
+    # caches or ignored files. A replaced ancestor is its own entry, never a directory alias.
+    names += [parent + (DIR_SUFFIX if _real_dir(workspace / parent) else "") for parent in _ancestors(names)]
     if (workspace / EXCLUDE_FILE).is_file() and not (workspace / ".git").is_symlink():
         names.append(EXCLUDE_FILE)
     found: Dict[str, str] = {}
     links: Dict[str, bool] = {}
     for name in sorted(set(names)):
-        top = Path(name).parts[0]
+        top = name.split("/", 1)[0]
         if top == RUN_ROOT or (top == ".git" and name != EXCLUDE_FILE):
             continue
-        if _link_above(workspace, name, links):
-            found[name] = MISSING
-        elif name.endswith(DIR_SUFFIX):
-            found[name] = DIR_DIGEST
-        else:
-            try:
-                found[name] = _entry_digest(workspace / name, name)
-            except OSError:
-                found[name] = MISSING
+        found[name] = MISSING if _link_above(workspace, name, links) else _digest_or_missing(workspace, name)
     return found
 
 
@@ -238,6 +282,17 @@ def fingerprint(workspace: Path) -> str:
 
 def changed_files(before: Dict[str, str], after: Dict[str, str]) -> List[str]:
     return sorted(name for name in set(before) | set(after) if before.get(name) != after.get(name))
+
+
+def closed_folders(workspace: Path, names: List[str]) -> List[str]:
+    """The listed folders (names ending in a slash) that exist but cannot be read and searched now."""
+    closed: List[str] = []
+    for name in sorted(names):
+        path = os.path.join(str(workspace), name.rstrip("/"))
+        if name.endswith(DIR_SUFFIX) and os.path.isdir(path) and not os.path.islink(path) \
+                and not os.access(path, os.R_OK | os.X_OK):
+            closed.append(name)
+    return closed
 
 
 def excerpt(output: str) -> str:
@@ -306,10 +361,12 @@ def change_summary(workspace: Path) -> str:
     return "\n".join(shown)
 
 
-def run_check(state: State, timeout: int = CHECK_TIMEOUT_SECONDS) -> Dict[str, Any]:
-    """Run the acceptance command the two models agreed on, inside the workspace."""
+def run_check(state: State, timeout: int = CHECK_TIMEOUT_SECONDS,
+              before: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    """Run the acceptance command the two models agreed on, inside the workspace. `before` is the
+    manifest the caller has just taken, when it has one: a large workspace is then not scanned twice."""
     workspace = Path(state["workspace"])
-    before = manifest(workspace)
+    before = manifest(workspace) if before is None else before
     code, output = run_command(state["accept_cmd"], workspace, timeout)
     after = manifest(workspace)
     normalised = VOLATILE_RE.sub("N", f"{code}\n{_tail(output)}")
@@ -373,9 +430,10 @@ def current_writer(state: State, current: str) -> Optional[str]:
     return state.get("last_writer")
 
 
-def finish_report(state: State, messages: List[Message]) -> Tuple[bool, List[str]]:
-    """Return (ready, reasons it is not ready)."""
-    current = fingerprint(Path(state["workspace"]))
+def finish_report(state: State, messages: List[Message], current: Optional[str] = None) -> Tuple[bool, List[str]]:
+    """Return (ready, reasons it is not ready). `current` is the workspace fingerprint when the caller
+    has already taken it in this command."""
+    current = fingerprint(Path(state["workspace"])) if current is None else current
     blocking: List[str] = []
     if proposals_missing(state, messages):
         blocking.append("the blind proposal round was skipped: both models must record a proposal")

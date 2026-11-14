@@ -46,11 +46,31 @@ which cannot follow it is refused with exit 6 and a message listing what is allo
 
 | Phase | What happens | Enforced by the runner |
 |---|---|---|
-| frame | Agree the goal and one acceptance command | Only at the start. A run needs an acceptance command or an explicit waiver before it can leave this phase (`--accept-later` starts without one); the command then locks and changing it later needs your agreement |
-| propose | Each model writes its own approach | Blind: the peer cannot be asked until the host's proposal is recorded; the host's proposal is withheld from the peer and stored encoded on disk until the peer has proposed, and the host cannot propose again after that |
-| plan | Proposals revealed; each attacks, concedes, defends with evidence; they pick one design and an ordered task list with a driver and reviewer per task | Refused until both proposals exist |
+| frame | Map requirements to observable checks, run the baseline, and agree what distinguishes success; identify a plausible wrong implementation that would pass the command | Only at the start. A run needs an acceptance command or an explicit waiver before it can leave this phase (`--accept-later` starts without one); the command then locks and changing it later needs your agreement |
+| propose | Inspect repository constraints; each model gives a design, three independent input/expected-output cases derived from the requirements, and its riskiest assumption | Blind: the peer cannot be asked until the host's proposal is recorded; the host's proposal is withheld from the peer and stored encoded on disk until the peer has proposed, and the host cannot propose again after that |
+| plan | Identify consequential differences and deciding evidence; combine compatible parts without inventing disagreement. Agree on ordered tasks with a driver and reviewer per task; by default the non-implementer writes tests from the proposal cases | Refused until both proposals exist |
 | build | One model edits at a time; the host names the one task before a peer build turn | Refused until each model's latest plan message ends in an approve verdict, or you have settled the disagreement. The peer is read-only unless the turn is given write access, which only build turns can have (a change in a read-only turn is undone) |
-| review | Each model tries to break what the other changed and gives a verdict | Follows build only. Only review-phase verdicts count; approving your own change is neither needed nor counted |
+| review | Inspect the current files, attempt the highest-risk uncovered requirement, and separate observed results from reasoning. Keep accepted counterexamples as regression tests in a later build turn | Follows build only. Only review-phase verdicts count toward finish; approving your own change is neither needed nor counted |
+
+Once an acceptance command is set, run `check` for the baseline **during frame, before acceptance
+locks**. If acceptance is waived, agree on evidence that will establish success instead. A refactor or other
+behaviour-preserving task may legitimately start green; separately check the requested structural
+or performance change. State what distinguishes success from the baseline. For other tasks, an
+unexpectedly green baseline is a reason to examine whether the command covers the goal. Fix the
+command in frame if needed; later changes need `accept --by-user "<words>"`.
+
+Verdicts have phase-specific meanings: in plan, `APPROVE` means **ready to implement**. In review,
+approve only after inspecting the current files, seeing acceptance pass on those files (unless
+explicitly waived), and testing an uncovered case. If a sandbox blocks that case, give the exact
+command for the other model to run as an experiment and wait for the result before approving.
+
+The default test/implementation split is per piece of work: the model that does not implement it
+writes its tests, in a build turn, from the independent proposal cases (or requirements when
+proposals were skipped). Explain exceptions and changed expectations. Review must list changed
+test/check files, identify removed or loosened assertions, and note when a planned split did not
+happen. These are participant duties; the runner does not verify test authorship or the quality
+of review evidence. If a named build task or approved plan is ambiguous, ask before editing;
+otherwise report the task, changed files, checks and results, and remaining gaps.
 
 The rest of the rules, each one line:
 
@@ -68,8 +88,8 @@ The rest of the rules, each one line:
   to `check`. Runs started before phases were tracked load as before: their phase is read from
   the last message either model recorded.
 
-`finish` succeeds only from build or review, when the acceptance command last passed on the files
-exactly as they are now and those same files (compared by content fingerprint) were approved in
+`finish` succeeds only from build or review, when the acceptance command last passed on the current
+files (unless waived) and those same files (compared by content fingerprint) were approved in
 review by everyone who must. The runner keeps the set of models that have changed files since
 they were last fully approved, by comparing the workspace around every command: one writer needs
 the other model's approval; two writers, or none, need both. A host edit made just before a peer
@@ -148,7 +168,14 @@ puts its output into the conversation.
 | Codex, sandboxed | Claude | `init --peer claude ...` | Claude plan mode inside Codex's sandbox | Claude edit mode |
 | Anything not sandboxed | Claude | `init --peer claude ...` | Claude's sandbox denies writes to the workspace; edit tools off | Claude edit mode in its sandbox |
 
-Every read-only turn, in every row, also has the snapshot-and-restore backstop.
+Read-only turns of a Claude peer also have the snapshot-and-restore backstop: if files change,
+they are put back and the change is saved for inspection. A Codex peer's read-only turns rely on
+its own sandbox, which blocks writes at the operating-system level, so no snapshot is taken (set
+`DUET_SNAPSHOT=always` to force one); the runner still compares the files before and after and
+reports any change, but does not undo it. Codex's sandbox does not confine MCP servers set up in
+your Codex configuration, so a write made through one would be reported, not reverted.
+
+### Sandbox recovery
 
 Both have been run live end to end. Notes for **Codex as host**:
 
@@ -157,6 +184,10 @@ Both have been run live end to end. Notes for **Codex as host**:
   --add-dir ~/.local/state/duet`, or approve the `peer` command to run outside the sandbox. The
   runner refuses when it detects a Codex sandbox without network. Without the second
   `--add-dir` the run is stored in the workspace (weaker isolation, see above).
+  If `init` or `peer` reports this restriction, stop and relay the message. The user must restart
+  Codex with those permissions or approve the external command; do not try other ways around
+  the sandbox. `init` checks client installation and known sandbox restrictions, not sign-in;
+  an unsigned-in client fails on its first peer turn.
 - Claude joins as a clean session (`--safe-mode`): no personal hooks, instructions or plugins.
   `--peer-user-config` loads them instead; measured on a one-line reply, that cost about six
   times as much.
@@ -168,6 +199,20 @@ Both have been run live end to end. Notes for **Codex as host**:
   host's sandbox does the confining. That sandbox allows writes to the workspace, so read-only
   turns use plan mode (edit tools blocked, shell commands not) and rely on the restore backstop.
 
+### Read-only recovery
+
+After a read-only violation, inspect `turns/<n>/readonly-violation/`: `changes.txt`, `files/`, and
+`changes.patch` preserve the change. A host or user edit made during the turn is indistinguishable
+from a peer edit and is saved there too; never edit concurrently with a peer turn. The verdict is
+void. If the change was only test by-products, add those by-products to `.gitignore`, run `check`,
+and request review again. Otherwise resolve any remaining changes and request another review.
+
+Do not assume the workspace was restored. Above `DUET_SNAPSHOT_MAX_MB` (default 1024 MB), or if
+copying the snapshot fails, there may be no snapshot to restore. Saving a changed file or restoring
+the snapshot can also fail; the runner preserves evidence where possible and reports what remains.
+Read those warnings and inspect the files before continuing. A failed peer turn can return exit 5
+even when its read-only violation was recorded; the same recovery duties apply.
+
 ## Use
 
 In Claude Code or Codex, ask for it: "run a duet with Codex to build X", or `/duet`.
@@ -178,19 +223,26 @@ By hand:
 D="python3 ~/.agents/skills/duet/scripts/duet.py"
 $D init --workspace . --goal-file /tmp/goal.md --accept "python3 -m pytest -q"   # prints the run folder
 # the goal can also come on stdin; write message files into <run>/drafts/
+$D check --run <run>                          # baseline in frame; record what success must change
+# refine acceptance with `accept --cmd` here if needed, before leaving frame
 $D say  --run <run> --phase propose --file <run>/drafts/proposal.md
 $D peer --run <run> --phase propose            # peer's blind proposal
 $D say  --run <run> --phase plan --file <run>/drafts/reply.md --verdict revise
-$D peer --run <run> --phase plan               # critique, one design, ordered tasks
+$D peer --run <run> --phase plan               # compare evidence, combine compatible parts, assign tasks
 $D say  --run <run> --phase plan --file <run>/drafts/agreed.md --verdict approve   # build needs both to approve
 $D experiment --run <run> --cmd "python3 probe.py"   # settle a dispute by evidence
-$D check  --run <run>                          # before building: it should fail
 $D say  --run <run> --phase build --file <run>/drafts/task.md   # name the one task
 $D peer --run <run> --phase build --write      # peer drives that task
 $D check  --run <run>                          # run the acceptance command
 $D say  --run <run> --phase review --file <run>/drafts/review.md --verdict approve
 $D finish --run <run>                          # the peer wrote, the host approved: done
 $D status --run <run>                          # phase, what may follow, what is blocking (JSON)
+```
+
+If the plan becomes invalid **before finishing**, return to plan explicitly and get fresh
+approvals before resuming build:
+
+```sh
 $D say  --run <run> --phase plan --replan "the API has no prefix scan" --file <run>/drafts/replan.md
 ```
 
@@ -201,11 +253,32 @@ Other options: `--peer claude` (when the host is Codex), `--peer-model`, `--peer
 "<reason>"` to set or replace the acceptance (with `--by-user "<words>"` after frame),
 `extend --turns N --cost DOLLARS --reason "..."`, `reseal --by-user "<words>"`.
 
-Exit codes: 0 done, 1 check or experiment failed, 2 usage, peer unreachable, a peer turn already
-running or a finished run, 3 turn or cost
-cap, 4 stalled, 5 peer turn failed, 6 phase out of order, 7 finish refused, 8 files
-changed during a read-only turn (restored), 9 in-workspace record edited outside the runner,
-70 internal fault.
+Defaults: peer `codex`, 30 peer turns, no cost cap unless `--max-cost` is supplied. Timeouts are
+2400 seconds for `peer`, 1800 for `check`, and 600 for `experiment` (override with `--timeout`).
+`extend --turns` and `--cost` add to existing caps; `--cost` cannot create a cap that was not set
+at init. Extensions need the user's instruction, recorded in `--reason`.
+
+### Exit codes
+
+| Code | Meaning and response |
+|---|---|
+| 0 | Command succeeded. Only successful `finish` means the run is complete; use `status` to inspect it. |
+| 1 | Acceptance check or experiment failed (including timeout). Read its recorded output and address the failure. |
+| 2 | Usage error, invalid run folder, unavailable client or known sandbox restriction, concurrent peer turn, or attempted mutation of a finished run. Correct the input, report launch restrictions, wait for an active turn, or leave a finished run unchanged as appropriate. |
+| 3 | Turn or cost cap reached. Report progress; extend only with the user's instruction using `extend --turns N` or `--cost DOLLARS`, plus `--reason "<their words>"`. |
+| 4 | Three consecutive acceptance failures with the same normalized output stalled the run. Ask the user and record their answer with `say --speaker user` before continuing peer turns. |
+| 5 | Peer failed, timed out or was interrupted. Inspect its recorded output and changed-file report; follow the retry procedure below. |
+| 6 | Phase out of order, including blind-proposal and plan-approval gates. Read the allowed phases in the error or `status`; use `--replan "<reason>"` for a justified return to plan. |
+| 7 | Finish refused. Resolve the blockers listed by `status`, then retry `finish`. |
+| 8 | A read-only peer turn changed workspace files. Its verdict is void; inspect saved evidence and restoration warnings, then follow [read-only recovery](#read-only-recovery). Files are not guaranteed to have been restored. |
+| 9 | An in-workspace run's `state.json` or `messages.jsonl` differs from its integrity record, or that record is missing. Approvals/check results are untrusted. Stop; only after the user inspects and accepts the record, run `reseal --by-user "<their words>"`. |
+| 70 | Internal runner fault. Report it; do not interpret it as a failed acceptance check. |
+
+For exit 5, if workspace files changed, the work may already be complete on disk: read the files
+and run `check` before deciding what to do next. Otherwise retry once in the same session. If it
+fails again because that session cannot resume, retry once with `peer --new-session`, which
+replays the conversation into a fresh session. On any other repeated failure, or a failed fresh
+session, stop and tell the user. Never continue alone and call it a duet.
 
 ## Install
 
@@ -240,7 +313,8 @@ Needs Python 3.9+ (standard library only) and the `codex` and `claude` clients s
   them. Nested repositories are compared file by file; empty folders, permission bits and
   `.git/info/exclude` are covered. Files over 100 MB are compared by size and modification time,
   symbolic links by their target.
-- A verdict counts only as the last non-empty line of a reply, outside any code fence.
+- A peer verdict counts only as the last non-empty line of its reply, outside any code fence;
+  the host records its verdict explicitly with `say --verdict approve|revise`.
 - `init` refuses a `DUET_HOME` inside the workspace.
 - The blind round stops accidental anchoring, not a determined reader: the sealed proposal is
   encoded, not encrypted, in both store locations.

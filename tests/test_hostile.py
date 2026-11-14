@@ -608,6 +608,8 @@ def test_failed_replan_turn_still_requires_both_to_plan_again(env, capsys, monke
     assert say(env, run, "sneak back", "--phase", "review") == cli.EXIT_ORDER
     assert say(env, run, "replanned", "--phase", "plan") == 0
     assert peer(run, "plan") == 0
+    assert say(env, run, "rebuilt", "--phase", "build") == cli.EXIT_ORDER  # the host has not approved the new plan
+    assert say(env, run, "replanned, agreed", "--phase", "plan", "--verdict", "approve") == 0
     assert say(env, run, "rebuilt", "--phase", "build") == 0
 
 

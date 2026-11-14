@@ -40,6 +40,17 @@ def warn(text: str) -> None:
     sys.stderr.write(f"duet: {text}\n")
 
 
+@contextmanager
+def transaction(run: Path, active: bool = True) -> Iterator[st.State]:
+    """Validate and commit under one lock; long commands use this for admission and receipt."""
+    with st.locked(run):
+        st.verify_integrity(run)
+        fresh = st.reconcile(run)
+        if active and fresh["status"] != "active":
+            raise st.DuetError(FINISHED_TEXT)
+        yield fresh
+
+
 def update(run: Path, change: Change) -> st.State:
     """Reload the state under the run's lock and replace only the fields `change` returns.
 

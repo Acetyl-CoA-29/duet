@@ -990,7 +990,7 @@ def test_shipped_tasks_behave_as_designed(capsys: pytest.CaptureFixture) -> None
     """Every shipped task: the starter fails, the reference passes everything, and the naive
     solution passes the visible command while failing the hidden oracle."""
     names = [t.name for t in tasklib.discover(cli.DEFAULT_TASKS_DIR)]
-    assert 4 <= len(names) <= 6
+    assert len(names) >= 4
     assert cli.main(["verify"]) == 0
     out = capsys.readouterr().out
     assert out.count("ok ") == 3 * len(names) and "WRONG" not in out and "MISSING" not in out

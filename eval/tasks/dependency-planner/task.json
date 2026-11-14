@@ -1,0 +1,5 @@
+{
+  "accept": "python3 -m pytest -q -p no:cacheprovider tests",
+  "protected": ["tests"],
+  "trap": "partial graph closure must reconcile cache boundaries, conditional ordering, deterministic readiness, and two callers"
+}

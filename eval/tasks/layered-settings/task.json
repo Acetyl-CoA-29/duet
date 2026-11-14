@@ -1,0 +1,5 @@
+{
+  "accept": "python3 -m pytest -q -p no:cacheprovider tests",
+  "protected": ["tests"],
+  "trap": "profile contributions are ordered edits, not independently default-filled snapshots; graph deduplication, reset scope and both consumers must agree"
+}
