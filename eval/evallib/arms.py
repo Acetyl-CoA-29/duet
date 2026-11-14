@@ -1,12 +1,16 @@
 """The arms being compared. Each arm is a function from a run's context to the exact command and
-the prompt that goes to it on stdin. Add an arm by writing a builder and registering it in ARMS."""
+the prompt that goes to it on stdin. Add an arm by writing a builder and registering it in ARMS;
+an arm made of several others (run each, keep one) goes in COMPOSITE_ARMS.
+
+Every arm gets the same task, acceptance command, rules and quality bar (`task_brief`). The only
+thing that differs between arms is the working method."""
 from __future__ import annotations
 
 import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 CLAUDE_BIN_ENV = "DUET_EVAL_CLAUDE_BIN"
 CODEX_BIN_ENV = "DUET_EVAL_CODEX_BIN"
@@ -18,6 +22,14 @@ COMMON_SECRETS = ("OPENROUTER_API_KEY", "GITHUB_TOKEN", "GH_TOKEN", "AWS_SECRET_
 DEFAULT_DUET_TURNS = 8
 # A Claude host's shell tool stops a command at ten minutes; a peer turn must end before that.
 MAX_PEER_TURN_SECONDS = 540
+BEST_OF_TWO = "best-of-two-solo"
+COMPOSITE_SHARE = 2            # a composite arm's members split the budget between them
+CLAUDE_PEER_EFFORT_NOTE = ("effort applies to the Codex host only: the duet runner has no effort option "
+                           "for a Claude peer, which runs at its own default")
+# What each token count includes. They are not the same quantity and are never added together.
+HOST_TOKEN_BASIS = "all input, cached included, plus output"
+PEER_TOKEN_BASIS = {"codex": "all input, cached included, plus output (as the duet runner counted it)",
+                    "claude": "uncached input plus output only (the duet runner drops cache reads and writes)"}
 
 
 @dataclass(frozen=True)
@@ -33,6 +45,7 @@ class ArmContext:
     duet_turns: int = DEFAULT_DUET_TURNS
     claude_home: Path = Path.home() / ".claude"
     duet_home: Path = Path.home() / ".local" / "state" / "duet"   # where the runner keeps its record
+    deny_read: Tuple[Path, ...] = ()   # folders a Claude client is told it may not read (results, tasks)
 
 
 @dataclass(frozen=True)
@@ -42,6 +55,7 @@ class Launch:
     cli: str                     # "claude" or "codex": whose output format and key rules apply
     duet: bool = False
     cost_note: str = ""
+    effort_note: str = ""        # set when the requested effort could not be given to both models
 
 
 def default_duet_home() -> Path:
@@ -81,6 +95,10 @@ def task_brief(ctx: ArmContext) -> str:
         "write anything outside it except where these instructions name a path.\n"
         "- Do not edit, delete or weaken the existing tests or the acceptance command.\n"
         "- The finished work is judged against the whole task description, not only the "
+        "acceptance command.\n\n"
+        "## Before the work counts as finished\n\n"
+        "Reread the task description line by line and check each requirement against the code. "
+        "Try at least one case the existing tests do not cover. Fix what you find and rerun the "
         "acceptance command.\n"
     )
 
@@ -92,10 +110,7 @@ def solo_prompt(ctx: ArmContext) -> str:
         "## How to work\n\n"
         "1. Read the task and the existing files.\n"
         "2. Make the change, then run the acceptance command. Iterate until it exits 0.\n"
-        "3. Review your own work before stopping: reread the task description line by line, "
-        "check each requirement against the code, and try at least one case the tests do not "
-        "cover. Fix what you find and rerun the acceptance command.\n"
-        "4. End with one short paragraph: what you changed and the acceptance command's final result.\n"
+        "3. End with one short paragraph: what you changed and the acceptance command's final result.\n"
     )
 
 
@@ -129,16 +144,19 @@ def duet_prompt(ctx: ArmContext, host: str) -> str:
     )
 
 
-def _claude_settings(ctx: Optional[ArmContext] = None, unsandboxed_prefix: Optional[str] = None) -> str:
+def _claude_settings(ctx: ArmContext, unsandboxed_prefix: Optional[str] = None) -> str:
     """Shell commands run in Claude's own sandbox (no network) without approval prompts. A duet
     host additionally runs the duet runner, and only that, outside the sandbox, and may write its
-    message drafts into the runner's state folder."""
+    message drafts into the runner's state folder. Reading the results and the tasks is denied."""
     sandbox: Dict[str, object] = {"enabled": True, "autoAllowBashIfSandboxed": True}
-    if ctx is not None and unsandboxed_prefix:
+    if unsandboxed_prefix:
         sandbox = {**sandbox,
                    "excludedCommands": [f"{unsandboxed_prefix} *", f"{unsandboxed_prefix}:*"],
                    "filesystem": {"allowWrite": [str(ctx.duet_home)]}}
-    return json.dumps({"sandbox": sandbox})
+    settings: Dict[str, object] = {"sandbox": sandbox}
+    if ctx.deny_read:
+        settings = {**settings, "permissions": {"deny": [f"Read(/{path}/**)" for path in ctx.deny_read]}}
+    return json.dumps(settings)
 
 
 def claude_host_rules(ctx: ArmContext, runner_prefix: str) -> List[str]:
@@ -196,7 +214,8 @@ def duet_claude_host(ctx: ArmContext) -> Launch:
 
 def duet_codex_host(ctx: ArmContext) -> Launch:
     return Launch(_codex_argv(ctx, reach_claude=True), duet_prompt(ctx, "codex"), "codex", duet=True,
-                  cost_note="dollars cover the Claude peer only (from the duet status); the Codex host reports tokens")
+                  cost_note="dollars cover the Claude peer only (from the duet's record); the Codex host reports tokens",
+                  effort_note=CLAUDE_PEER_EFFORT_NOTE if ctx.effort else "")
 
 
 ArmBuilder = Callable[[ArmContext], Launch]
@@ -207,3 +226,56 @@ ARMS: Dict[str, ArmBuilder] = {
     "duet-claude-host": duet_claude_host,
     "duet-codex-host": duet_codex_host,
 }
+# Arms made of other arms: each member runs in its own workspace on a share of the budget, and one
+# result is kept (see runner.pick_member). No conversation takes place between the members.
+COMPOSITE_ARMS: Dict[str, Tuple[str, ...]] = {BEST_OF_TWO: ("solo-claude", "solo-codex")}
+
+
+def arm_names() -> List[str]:
+    return [*ARMS, *COMPOSITE_ARMS]
+
+
+def is_duet(arm: str) -> bool:
+    return arm.startswith("duet")
+
+
+def duet_timeout(solo_timeout: int, duet_turns: int) -> int:
+    """A duet's wall-clock limit: one solo allowance for the host's own work plus half of one for
+    every peer turn it is allowed. A duet waits on a second model turn after turn, so giving it a
+    solo run's limit would make it fail on time alone."""
+    return solo_timeout * (2 + duet_turns) // 2
+
+
+def arm_timeout(arm: str, solo_timeout: int, duet_turns: int, duet_override: Optional[int] = None) -> int:
+    """Seconds one client of this arm may run."""
+    if is_duet(arm):
+        return duet_override if duet_override is not None else duet_timeout(solo_timeout, duet_turns)
+    if arm in COMPOSITE_ARMS:
+        return max(1, solo_timeout // COMPOSITE_SHARE)
+    return solo_timeout
+
+
+def arm_max_cost(arm: str, max_cost: Optional[float]) -> Optional[float]:
+    """Dollars one client of this arm may spend, where its client enforces a cap."""
+    if max_cost is not None and arm in COMPOSITE_ARMS:
+        return max_cost / COMPOSITE_SHARE
+    return max_cost
+
+
+def timeout_note(arm: str, solo_timeout: int, duet_turns: int, duet_override: Optional[int] = None) -> str:
+    """One line saying why this arm's limit differs from a solo run's; empty when it does not."""
+    limit = arm_timeout(arm, solo_timeout, duet_turns, duet_override)
+    if is_duet(arm) and duet_override is not None:
+        return f"duet arms get {limit}s (set with --duet-timeout); a solo arm gets {solo_timeout}s"
+    if is_duet(arm):
+        return (f"duet arms get {limit}s: {solo_timeout}s for the host's own work plus half of that for "
+                f"each of the {duet_turns} peer turns allowed; a solo arm gets {solo_timeout}s")
+    if arm in COMPOSITE_ARMS:
+        return f"each member gets half the solo budget: {limit}s and half the dollar cap"
+    return ""
+
+
+def token_basis(launch: Launch) -> Dict[str, Optional[str]]:
+    """What the host's and the peer's token counts include for this launch."""
+    peer = ("codex" if launch.cli == "claude" else "claude") if launch.duet else None
+    return {"host": HOST_TOKEN_BASIS, "peer": PEER_TOKEN_BASIS[peer] if peer else None}

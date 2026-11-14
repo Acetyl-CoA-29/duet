@@ -9,11 +9,16 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from . import gates
+
 DEFAULT_MAX_MB = 1024
 MAX_ENV = "DUET_SNAPSHOT_MAX_MB"
 PATCH_MAX_BYTES = 1024 * 1024
 CLONE_NOFOLLOW = 1
-MISSING = "unreadable-or-deleted"  # the manifest's value for a listed file that is not on disk
+MISSING = gates.MISSING  # the manifest's value for a listed file that is not on disk
+DIR_SUFFIX = gates.DIR_SUFFIX  # the manifest lists an empty folder under its name with this suffix
+KEPT_NAME = "snapshot-kept"  # where the copy stays when the workspace could not be put back exactly
+STILL_DIFFERS = "(workspace still differs)"
 
 Manifest = Dict[str, str]
 
@@ -63,7 +68,10 @@ def take(workspace: Path, files: Manifest, dest: Path) -> bool:
         return False
     for name in names:
         try:
-            copy_entry(workspace / name, dest / name)
+            if name.endswith(DIR_SUFFIX):
+                (dest / name).mkdir(parents=True, exist_ok=True)
+            else:
+                copy_entry(workspace / name, dest / name)
         except OSError:
             shutil.rmtree(dest, ignore_errors=True)
             return False
@@ -112,7 +120,7 @@ def save_evidence(workspace: Path, snap: Optional[Path], changed: List[str], bef
     patch: List[str] = []
     for name in changed:
         current = workspace / name
-        if _present(current) and not current.is_dir():
+        if not _link_above(workspace, current) and _present(current) and not current.is_dir():
             try:
                 copy_entry(current, dest / "files" / name)
             except OSError:
@@ -127,8 +135,19 @@ def save_evidence(workspace: Path, snap: Optional[Path], changed: List[str], bef
     return listing
 
 
+def _link_above(workspace: Path, target: Path) -> bool:
+    """True when a folder between the workspace and the target is a symbolic link. Whatever sits behind
+    such a link is not the workspace's: it is never read as evidence, removed or written."""
+    folder = workspace
+    for part in target.relative_to(workspace).parts[:-1]:
+        folder = folder / part
+        if folder.is_symlink():
+            return True
+    return False
+
+
 def _prune_empty_parents(workspace: Path, path: Path) -> None:
-    """Drop folders left empty by removing a file the peer created; stops at the first that is not empty."""
+    """Drop folders left empty by removing something the peer created; stops at the first that is not empty."""
     folder = path.parent
     while folder != workspace and workspace in folder.parents:
         try:
@@ -138,17 +157,69 @@ def _prune_empty_parents(workspace: Path, path: Path) -> None:
         folder = folder.parent
 
 
-def restore(workspace: Path, snap: Path, changed: List[str], before: Manifest) -> List[str]:
-    """Put each changed file back as it was. Returns the names that could not be restored."""
-    failed: List[str] = []
+def _clear(workspace: Path, changed: List[str], before: Manifest, failed: List[str]) -> List[Path]:
+    """Remove what is there now for every changed name; return the folders the peer created."""
+    made: List[Path] = []
     for name in changed:
         target = workspace / name
         try:
+            if _link_above(workspace, target):
+                continue  # behind a link: the link is its own entry, and what it points at is left alone
+            if name.endswith(DIR_SUFFIX):
+                if before.get(name, MISSING) == MISSING:
+                    made.append(target)
+                continue
             _remove(target)
             if before.get(name, MISSING) == MISSING:
                 _prune_empty_parents(workspace, target)
+        except OSError:
+            failed.append(name)
+    return made
+
+
+def _put_back(workspace: Path, snap: Path, changed: List[str], before: Manifest, failed: List[str]) -> None:
+    for name in changed:
+        if before.get(name, MISSING) == MISSING or name in failed:
+            continue
+        target = workspace / name
+        try:
+            if _link_above(workspace, target):
+                raise OSError("a folder on the way is a symbolic link")
+            if name.endswith(DIR_SUFFIX):
+                target.mkdir(parents=True, exist_ok=True)
             else:
                 copy_entry(snap / name, target)
         except OSError:
             failed.append(name)
+
+
+def restore(workspace: Path, snap: Path, changed: List[str], before: Manifest) -> List[str]:
+    """Put each changed file, link and empty folder back as it was, never writing through a symbolic
+    link. Returns the names that could not be restored (plus STILL_DIFFERS when the workspace does not
+    match afterwards for another reason); in that case the snapshot is kept beside the turn as KEPT_NAME."""
+    failed: List[str] = []
+    ordered = sorted(changed)
+    for folder in reversed(_clear(workspace, ordered, before, failed)):
+        try:
+            folder.rmdir()
+            _prune_empty_parents(workspace, folder)
+        except OSError:
+            pass  # it holds ignored files or caches; the comparison below decides
+    _put_back(workspace, snap, ordered, before, failed)
+    if not failed and gates.manifest(workspace) != before:
+        failed.append(STILL_DIFFERS)
+    if failed:
+        keep(snap)
     return failed
+
+
+def keep(snap: Path) -> Optional[Path]:
+    """Move a snapshot out of the way of `discard`, so the originals survive a failed restore."""
+    kept = snap.parent / KEPT_NAME
+    try:
+        if kept.exists():
+            shutil.rmtree(kept)
+        snap.rename(kept)
+    except OSError:
+        return None
+    return kept

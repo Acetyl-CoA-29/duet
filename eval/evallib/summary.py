@@ -1,143 +1,175 @@
-"""Turn run records into the comparison table."""
+"""Turn run records into per-arm counts. Formatting lives in report.py.
+
+Nothing is dropped quietly: every record under `records/` is counted, reruns set aside by the
+runner are reported as a number, and sessions are kept apart unless the caller merges them."""
 from __future__ import annotations
 
 import json
+import math
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from . import usage
+
 Record = Dict[str, Any]
-HEADERS = ("arm", "runs", "hidden pass", "visible pass", "looked done, wasn't",
-           "duet finished", "mean $", "mean tokens", "mean sec")
-# Claude counts cache reads and writes apart from input; Codex includes cached input in input.
-TOTAL_TOKEN_FIELDS = ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens")
+RECORDS_FOLDER = "records"
+SUPERSEDED = "superseded"
+MANIFEST = "session.json"
+LIMIT_FIELDS = ("timeout", "duet_timeout", "max_cost", "effort", "duet_turns")
+LEGACY_LIMIT_FIELDS = ("timeout", "max_cost", "effort")   # records from before sessions recorded their limits
+Z_95 = 1.959964
 
 
-def load_records(root: Path) -> List[Record]:
-    """Every record under a results root or a single session folder; unreadable files are named, not skipped silently."""
-    paths = sorted(root.rglob("records/*.json")) if root.is_dir() else []
-    records: List[Record] = []
-    for path in paths:
-        try:
-            value = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            raise ValueError(f"{path}: unreadable record ({exc})") from exc
-        if isinstance(value, dict) and "arm" in value and "task" in value:
-            records.append(value)
-    return records
+@dataclass(frozen=True)
+class Session:
+    name: str
+    records: List[Record]
+    superseded: int = 0                     # earlier attempts set aside by a rerun; not counted
+    stopped_early: List[str] = field(default_factory=list)
 
 
-def latest_per_run(records: Iterable[Record]) -> List[Record]:
-    """One record per (task, arm, seed): the most recently started, so a rerun replaces the old one."""
-    chosen: Dict[Tuple[str, str, int], Record] = {}
-    for record in sorted(records, key=lambda r: str(r.get("started_at", ""))):
-        chosen[(record["task"], record["arm"], int(record.get("seed", 1)))] = record
-    return list(chosen.values())
+def _load_record(path: Path) -> Optional[Record]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"{path}: unreadable record ({exc})") from exc
+    return value if isinstance(value, dict) and "arm" in value and "task" in value else None
+
+
+def _stopped_early(session_dir: Path) -> List[str]:
+    """Reasons recorded by invocations that ended before their plan was done."""
+    try:
+        manifest = json.loads((session_dir / MANIFEST).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    invocations = manifest.get("invocations") if isinstance(manifest, dict) else None
+    return [str(item["stopped_early"]) for item in invocations or []
+            if isinstance(item, dict) and item.get("stopped_early")]
+
+
+def _load_session(session_dir: Path) -> Session:
+    folder = session_dir / RECORDS_FOLDER
+    loaded = [_load_record(path) for path in sorted(folder.glob("*.json"))]
+    records = [{**record, "eval_session": session_dir.name} for record in loaded if record is not None]
+    aside = folder / SUPERSEDED
+    superseded = len(list(aside.glob("*.json"))) if aside.is_dir() else 0
+    return Session(session_dir.name, records, superseded, _stopped_early(session_dir))
+
+
+def load_sessions(root: Path) -> Dict[str, Session]:
+    """Sessions under a results root, or the one session `root` itself is, by name. Unreadable
+    records are named, not skipped silently."""
+    if (root / RECORDS_FOLDER).is_dir():
+        folders = [root]
+    else:
+        folders = sorted(p for p in root.iterdir() if (p / RECORDS_FOLDER).is_dir()) if root.is_dir() else []
+    return {folder.name: _load_session(folder) for folder in folders}
+
+
+def limits_key(record: Record) -> Tuple[Any, ...]:
+    """The limits a record was run under, in a form that can be compared across sessions."""
+    shared = record.get("session_limits")
+    if isinstance(shared, dict):
+        return tuple(shared.get(name) for name in LIMIT_FIELDS)
+    own = record.get("limits") or {}
+    return tuple(own.get(name) for name in LEGACY_LIMIT_FIELDS)
+
+
+def distinct_limits(records: Iterable[Record]) -> List[Tuple[Any, ...]]:
+    return sorted({limits_key(record) for record in records}, key=repr)
+
+
+def wilson(hits: int, total: int) -> Optional[Tuple[float, float]]:
+    """95% Wilson interval for a proportion; None when there are no runs."""
+    if total <= 0:
+        return None
+    share = hits / total
+    spread = Z_95 * math.sqrt(share * (1 - share) / total + Z_95 ** 2 / (4 * total ** 2))
+    centre, scale = share + Z_95 ** 2 / (2 * total), 1 + Z_95 ** 2 / total
+    low, high = round((centre - spread) / scale, 10), round((centre + spread) / scale, 10)
+    return max(0.0, low), min(1.0, high)
 
 
 def _mean(values: Sequence[float]) -> Optional[float]:
     return sum(values) / len(values) if values else None
 
 
-def _rate(hits: int, total: int) -> Optional[float]:
-    return hits / total if total else None
+def _numbers(records: Sequence[Record], name: str) -> List[float]:
+    return [float(r[name]) for r in records if isinstance(r.get(name), (int, float)) and not isinstance(r.get(name), bool)]
 
 
-def _passed(record: Record, which: str) -> bool:
+def passed(record: Record, which: str) -> bool:
     return bool((record.get(which) or {}).get("passed"))
 
 
-def _total_tokens(record: Record) -> Optional[int]:
-    tokens = record.get("tokens") or {}
-    counted = [tokens[name] for name in TOTAL_TOKEN_FIELDS if isinstance(tokens.get(name), (int, float))]
-    peer = record.get("peer_tokens")
-    if isinstance(peer, (int, float)) and not isinstance(peer, bool):
-        counted = counted + [peer]        # a duet's peer, where its status reported them
-    return int(sum(counted)) if counted else None
+def is_infra(record: Record) -> bool:
+    """True when the run says nothing about the model: the tooling failed, not the work."""
+    return bool(record.get("infra_failure")) or record.get("status") == "not_started"
+
+
+def per_protocol(record: Record) -> bool:
+    """A duet that tested the duet as designed: the peer took part and the run finished."""
+    duet = record.get("duet") or {}
+    turns = duet.get("peer_turns")
+    return duet.get("finished") is True and isinstance(turns, int) and not isinstance(turns, bool) and turns > 0
+
+
+def host_tokens(record: Record) -> Optional[int]:
+    stored = record.get("host_tokens")
+    if isinstance(stored, (int, float)) and not isinstance(stored, bool):
+        return int(stored)
+    return usage.total_tokens(record.get("tokens") or {})
 
 
 def arm_stats(records: Sequence[Record]) -> Dict[str, Any]:
-    """Aggregate one arm's records. Rates are over all its runs; means are over runs that reported the figure."""
-    total = len(records)
-    hidden = sum(1 for r in records if _passed(r, "hidden"))
-    visible = sum(1 for r in records if _passed(r, "visible"))
-    false_done = sum(1 for r in records if _passed(r, "visible") and not _passed(r, "hidden"))
-    duets = [r for r in records if r.get("is_duet")]
-    costs = [float(r["cost_usd"]) for r in records if isinstance(r.get("cost_usd"), (int, float))]
-    tokens = [t for t in (_total_tokens(r) for r in records) if t is not None]
+    """Counts for one arm. Pass counts and means are over valid runs: every run except
+    infrastructure failures, which are counted on their own."""
+    valid = [r for r in records if not is_infra(r)]
+    duets = [r for r in valid if r.get("is_duet")]
+    protocol = [r for r in duets if per_protocol(r)]
+    hidden = sum(1 for r in valid if passed(r, "hidden"))
+    costs, host = _numbers(valid, "cost_usd"), [t for t in (host_tokens(r) for r in valid) if t is not None]
     return {
-        "runs": total,
-        "hidden_pass_rate": _rate(hidden, total),
-        "visible_pass_rate": _rate(visible, total),
-        "visible_pass_hidden_fail_rate": _rate(false_done, total),
+        "runs": len(records), "infra": len(records) - len(valid), "valid": len(valid),
+        "timeouts": sum(1 for r in records if r.get("timed_out")),
+        "hidden_pass": hidden, "hidden_ci": wilson(hidden, len(valid)),
+        "visible_pass": sum(1 for r in valid if passed(r, "visible")),
+        "false_done": sum(1 for r in valid if passed(r, "visible") and not passed(r, "hidden")),
         "duet_runs": len(duets),
         "duet_finished": sum(1 for r in duets if (r.get("duet") or {}).get("finished") is True),
         "duet_unknown": sum(1 for r in duets if (r.get("duet") or {}).get("finished") not in (True, False)),
+        "per_protocol_runs": len(protocol),
+        "per_protocol_hidden_pass": sum(1 for r in protocol if passed(r, "hidden")),
         "mean_cost_usd": _mean(costs), "cost_runs": len(costs),
-        "mean_tokens": _mean(tokens), "token_runs": len(tokens),
-        "mean_seconds": _mean([float(r["seconds"]) for r in records if isinstance(r.get("seconds"), (int, float))]),
-        "timeouts": sum(1 for r in records if r.get("timed_out")),
+        "mean_host_tokens": _mean(host), "mean_peer_tokens": _mean(_numbers(valid, "peer_tokens")),
+        "mean_seconds": _mean(_numbers(valid, "seconds")),
+        "leak_flagged": sum(1 for r in records if r.get("oracle_paths_seen")),
     }
 
 
 def summarize(records: Iterable[Record]) -> Dict[str, Dict[str, Any]]:
     grouped: Dict[str, List[Record]] = {}
-    for record in latest_per_run(records):
+    for record in records:
         grouped.setdefault(record["arm"], []).append(record)
     return {arm: arm_stats(grouped[arm]) for arm in sorted(grouped)}
 
 
-def _percent(value: Optional[float]) -> str:
-    return "-" if value is None else f"{value * 100:.0f}%"
+def balance_problems(records: Sequence[Record]) -> List[str]:
+    """Arms that did not run every (task, seed) the session ran: their rates cover different work."""
+    cells = {(r["task"], int(r.get("seed", 1))) for r in records}
+    problems: List[str] = []
+    for arm in sorted({r["arm"] for r in records}):
+        covered = {(r["task"], int(r.get("seed", 1))) for r in records if r["arm"] == arm}
+        if covered != cells:
+            problems.append(f"{arm} has {len(covered)} of {len(cells)} (task, seed) cells")
+    return problems
 
 
-def _row(arm: str, stats: Dict[str, Any]) -> Tuple[str, ...]:
-    if stats["duet_runs"]:
-        finished = f"{stats['duet_finished']}/{stats['duet_runs']}"
-        if stats["duet_unknown"]:
-            finished += f" ({stats['duet_unknown']} unknown)"
-    else:
-        finished = "-"
-    cost = "-" if stats["mean_cost_usd"] is None else f"{stats['mean_cost_usd']:.2f}"
-    if stats["mean_cost_usd"] is not None and stats["cost_runs"] != stats["runs"]:
-        cost += f" (n={stats['cost_runs']})"
-    tokens = "-" if stats["mean_tokens"] is None else f"{stats['mean_tokens']:,.0f}"
-    seconds = "-" if stats["mean_seconds"] is None else f"{stats['mean_seconds']:.0f}"
-    return (arm, str(stats["runs"]), _percent(stats["hidden_pass_rate"]), _percent(stats["visible_pass_rate"]),
-            _percent(stats["visible_pass_hidden_fail_rate"]), finished, cost, tokens, seconds)
-
-
-def _table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> str:
-    widths = [max(len(str(cell)) for cell in column) for column in zip(headers, *rows)]
-    line = lambda cells: "  ".join(str(cell).ljust(width) for cell, width in zip(cells, widths)).rstrip()  # noqa: E731
-    return "\n".join([line(headers), line(["-" * width for width in widths])] + [line(row) for row in rows])
-
-
-def format_summary(records: Sequence[Record]) -> str:
-    if not records:
-        return "No records found."
-    stats = summarize(records)
-    table = _table(HEADERS, [_row(arm, stats[arm]) for arm in stats])
-    notes = [
-        "",
-        "hidden pass: share of runs whose finished workspace passes the hidden oracle.",
-        "looked done, wasn't: share of runs that pass the visible command but fail the oracle.",
-        "mean $: dollars the clients reported. Codex reports tokens only, so a Codex-hosted arm's",
-        "        dollars are partial or missing; compare tokens and seconds as well.",
-    ]
-    return table + "\n" + "\n".join(notes)
-
-
-def format_by_task(records: Sequence[Record]) -> str:
-    """One row per task, one column per arm: hidden result for each seed (P pass, F fail, v = visible passed)."""
-    latest = latest_per_run(records)
-    arms = sorted({r["arm"] for r in latest})
-    tasks = sorted({r["task"] for r in latest})
-    rows = []
-    for task in tasks:
-        cells = [task]
-        for arm in arms:
-            runs = sorted((r for r in latest if r["task"] == task and r["arm"] == arm), key=lambda r: r.get("seed", 1))
-            cells.append(" ".join(("P" if _passed(r, "hidden") else "F") + ("v" if _passed(r, "visible") else "")
-                                  for r in runs) or "-")
-        rows.append(cells)
-    return _table(["task"] + arms, rows) + "\n\nP/F = hidden oracle passed/failed, v = visible command passed."
+def repeated_cells(records: Sequence[Record]) -> int:
+    """How many (task, arm, seed) combinations have more than one record (all of them are counted)."""
+    seen: Dict[Tuple[str, str, int], int] = {}
+    for record in records:
+        key = (record["task"], record["arm"], int(record.get("seed", 1)))
+        seen = {**seen, key: seen.get(key, 0) + 1}
+    return sum(1 for count in seen.values() if count > 1)

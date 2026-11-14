@@ -7,6 +7,9 @@ from typing import Any, Dict, Iterator, Optional
 
 TOKEN_FIELDS = ("input_tokens", "cached_input_tokens", "cache_read_input_tokens",
                 "cache_creation_input_tokens", "output_tokens", "reasoning_output_tokens")
+# One client's total: all input including cached, plus output. Claude counts cache reads and writes
+# apart from input; Codex includes cached input in input (and reasoning in output).
+TOTAL_TOKEN_FIELDS = ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens")
 
 
 @dataclass(frozen=True)
@@ -53,8 +56,15 @@ def _token_counts(raw: Any) -> Dict[str, int]:
             if isinstance(raw.get(name), (int, float)) and not isinstance(raw.get(name), bool)}
 
 
-def _add(left: Dict[str, int], right: Dict[str, int]) -> Dict[str, int]:
+def add_tokens(left: Dict[str, int], right: Dict[str, int]) -> Dict[str, int]:
     return {name: left.get(name, 0) + right.get(name, 0) for name in list(left) + [n for n in right if n not in left]}
+
+
+def total_tokens(tokens: Any) -> Optional[int]:
+    """All input (cached included) plus output for one client; None when it reported no counts."""
+    counted = [tokens[name] for name in TOTAL_TOKEN_FIELDS
+               if isinstance(tokens, dict) and isinstance(tokens.get(name), (int, float))]
+    return int(sum(counted)) if counted else None
 
 
 def parse_claude(output: str) -> Usage:
@@ -87,7 +97,7 @@ def parse_codex(output: str, last_message: str = "") -> Usage:
         if kind == "thread.started" and isinstance(event.get("thread_id"), str):
             session, seen = event["thread_id"], True
         elif kind == "turn.completed":
-            tokens, seen = _add(tokens, _token_counts(event.get("usage"))), True
+            tokens, seen = add_tokens(tokens, _token_counts(event.get("usage"))), True
         elif kind in ("turn.failed", "error"):
             failed, seen = True, True
         elif kind == "item.completed":

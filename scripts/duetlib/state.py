@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import fcntl
+import hashlib
 import json
 import os
 import secrets
@@ -12,7 +13,7 @@ import zlib
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional
 
 from . import store
 from .store import MESSAGES_FILE, RUN_ROOT, STATE_FILE, DuetError, TamperError  # noqa: F401 - re-exported
@@ -68,10 +69,29 @@ def load_state(run: Path) -> State:
         raise DuetError(f"{path} is not valid JSON: {exc}") from exc
 
 
+def _write_state(run: Path, state: State) -> None:
+    """Write state.json and seal it. Call with the run's lock held."""
+    text = json.dumps(state, indent=2, sort_keys=True) + "\n"
+    # Seal first with the digest the file is about to have: a kill between the two steps is then
+    # neither a lost write nor a false tamper report.
+    store.reseal(run, pending={STATE_FILE: hashlib.sha256(text.encode("utf-8")).hexdigest()})
+    _write_atomic(run / STATE_FILE, text)
+    store.reseal(run)
+
+
 def save_state(run: Path, state: State) -> None:
     with locked(run):
-        _write_atomic(run / STATE_FILE, json.dumps(state, indent=2, sort_keys=True) + "\n")
-        store.reseal(run)
+        _write_state(run, state)
+
+
+def update_state(run: Path, change: Callable[[State], Dict[str, Any]]) -> State:
+    """Read state.json, apply `change(fresh)` on top of it and write it back, all under the run's lock,
+    so a command that took a long time cannot overwrite what another command saved meanwhile."""
+    with locked(run):
+        fresh = load_state(run)
+        state = {**fresh, **change(fresh)}
+        _write_state(run, state)
+    return state
 
 
 def verify_integrity(run: Path) -> Optional[str]:
@@ -80,6 +100,13 @@ def verify_integrity(run: Path) -> Optional[str]:
         return None
     with locked(run):
         return store.verify(run)
+
+
+def verify_after_turn(run: Path) -> None:
+    """Check an in-workspace run's record again once the peer's process has exited and before anything
+    is written: an edit the peer made during its own turn must not be sealed in by the next write.
+    Raises TamperError; does nothing for runs kept in a state directory."""
+    verify_integrity(run)
 
 
 def reseal(run: Path) -> None:
@@ -97,7 +124,9 @@ def read_messages(run: Path) -> List[Message]:
     path = run / MESSAGES_FILE
     if not path.is_file():
         return []
-    lines = [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    # Records are split on "\n" alone: str.splitlines() also breaks on U+2028, U+2029 and U+0085, which
+    # JSON leaves unescaped inside message text.
+    lines = [line for line in path.read_text(encoding="utf-8").split("\n") if line.strip()]
     try:
         raw = [json.loads(line) for line in lines]
     except json.JSONDecodeError as exc:
@@ -135,8 +164,12 @@ def append_message(
         }
         if sealed:
             message["sealed_text"] = _seal(text)
-        with (run / MESSAGES_FILE).open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(message, ensure_ascii=False) + "\n")
+        record = (json.dumps(message, ensure_ascii=False) + "\n").encode("utf-8")
+        log = run / MESSAGES_FILE
+        so_far = log.read_bytes() if log.is_file() else b""
+        store.reseal(run, pending={MESSAGES_FILE: hashlib.sha256(so_far + record).hexdigest()})
+        with log.open("ab") as fh:
+            fh.write(record)
         with (run / TRANSCRIPT_FILE).open("a", encoding="utf-8") as fh:
             fh.write(_render(message))
         store.reseal(run)
@@ -189,6 +222,7 @@ def new_run(
         raise DuetError(f"workspace does not exist: {workspace}")
     if peer_effort and not peer_effort.isalnum():
         raise DuetError("--peer-effort must be a single word such as low, high or ultra")
+    goal = goal.replace("\ufeff", "")  # a byte-order mark is not content
     if not goal.strip():
         raise DuetError("the goal is empty")
     run_id = datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(2)

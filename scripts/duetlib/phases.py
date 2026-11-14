@@ -55,9 +55,34 @@ def _last_replan(messages: List[Message]) -> int:
     return max((m["seq"] for m in messages if m["kind"] == REPLAN_KIND), default=0)
 
 
+def _plan_refusal(state: State, messages: List[Message]) -> Optional[str]:
+    """Why the plan is not agreed yet (None if it is): both spoke, and each approved or the user settled it."""
+    since = _last_replan(messages)
+    latest: Dict[str, Message] = {}
+    for message in _model_messages(state, messages):
+        if _label(message) == PLAN and message["seq"] > since:
+            latest[message["speaker"]] = message
+    if not {state["host"], state["peer"]} <= set(latest):
+        return "build opens once both models have spoken in plan: take a plan turn each first"
+    if state.get("phase") not in PHASES:
+        return None  # runs recorded before phases were tracked carried no plan verdicts
+    unagreed = [m for m in latest.values() if (m.get("meta") or {}).get("verdict") != "approve"]
+    if not unagreed:
+        return None
+    last_objection = max(m["seq"] for m in unagreed)
+    if any(m["speaker"] == "user" and m["kind"] == "message" and m["seq"] > last_objection for m in messages):
+        return None
+    names = " and ".join(sorted(m["speaker"] for m in unagreed))
+    return (f"build opens once each model's latest plan message ends in an approve verdict (not yet: {names}), "
+            "or the user has settled the disagreement (`say --speaker user`)")
+
+
 def _forward_refusal(state: State, messages: List[Message], here: str, target: str) -> Optional[str]:
     """Why the run may not step forward from `here` to `target` (None if it may)."""
     skip = bool(state.get("skip_proposals"))
+    if here == FRAME and not (state.get("accept_cmd") or state.get("accept_waived")):
+        return ("frame must settle the acceptance command before the run moves on: record it with "
+                "`accept --cmd \"<command>\"` (or `accept --waive \"<reason>\"`)")
     if target == PLAN:
         if skip or _both_spoke(state, messages, PROPOSE):
             return None
@@ -66,9 +91,7 @@ def _forward_refusal(state: State, messages: List[Message], here: str, target: s
         return ("no build before the blind proposal round and a joint plan (or the run must have been "
                 "started with --skip-proposals)")
     if target == BUILD and here == PLAN and not skip:
-        if _both_spoke(state, messages, PLAN, _last_replan(messages)):
-            return None
-        return "build opens once both models have spoken in plan: take a plan turn each first"
+        return _plan_refusal(state, messages)
     if target == REVIEW and here != BUILD:
         return "review follows build: record or run a build turn first"
     return None

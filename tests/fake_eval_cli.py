@@ -5,11 +5,15 @@ a model. It acts as Codex when its first argument is `exec`, otherwise as Claude
 Behaviour is set through environment variables:
   FAKE_EVAL_LOG       append one JSON line describing this call (argv, stdin, cwd, files seen, secrets)
   FAKE_EVAL_OVERLAY   copy this folder over the current directory (the "solution" the model wrote)
+  FAKE_EVAL_OVERLAY_CODEX  the same, used instead when acting as Codex (so the two clients can differ)
   FAKE_EVAL_SLEEP     seconds to sleep before answering
   FAKE_EVAL_CHILD_PID start a long-lived grandchild and write its pid to this file
   FAKE_EVAL_EXIT      exit code
+  FAKE_EVAL_STDERR    extra text printed on standard error
   FAKE_EVAL_REPLY     final message
   FAKE_EVAL_DUET      write this text to .duet/run-1/state.json (a duet that left a status behind)
+  FAKE_EVAL_STATE_RUNS  write that state to <this folder>/run-1/state.json instead, with a "workspace"
+                      field naming the current directory (a duet kept in the runner's state directory)
   FAKE_EVAL_TAMPER    overwrite this workspace-relative file with a test that always passes
 """
 import json
@@ -39,7 +43,7 @@ if pid_file:
     with open(pid_file, "w", encoding="utf-8") as handle:
         handle.write(str(grandchild.pid))
 
-overlay = os.environ.get("FAKE_EVAL_OVERLAY")
+overlay = (os.environ.get("FAKE_EVAL_OVERLAY_CODEX") if is_codex else None) or os.environ.get("FAKE_EVAL_OVERLAY")
 if overlay:
     shutil.copytree(overlay, ".", dirs_exist_ok=True)
 
@@ -49,9 +53,13 @@ if tamper:
         handle.write("def test_nothing():\n    assert True\n")
 
 duet_state = os.environ.get("FAKE_EVAL_DUET")
+state_runs = os.environ.get("FAKE_EVAL_STATE_RUNS")
 if duet_state:
-    os.makedirs(os.path.join(".duet", "run-1"), exist_ok=True)
-    with open(os.path.join(".duet", "run-1", "state.json"), "w", encoding="utf-8") as handle:
+    folder = os.path.join(state_runs, "run-1") if state_runs else os.path.join(".duet", "run-1")
+    os.makedirs(folder, exist_ok=True)
+    if state_runs:
+        duet_state = json.dumps({**json.loads(duet_state), "workspace": os.getcwd()})
+    with open(os.path.join(folder, "state.json"), "w", encoding="utf-8") as handle:
         handle.write(duet_state)
 
 if is_codex:
@@ -63,6 +71,8 @@ time.sleep(float(os.environ.get("FAKE_EVAL_SLEEP", "0")))
 
 code = int(os.environ.get("FAKE_EVAL_EXIT", "0"))
 reply = os.environ.get("FAKE_EVAL_REPLY", "Done. The acceptance command passes.")
+if os.environ.get("FAKE_EVAL_STDERR"):
+    print(os.environ["FAKE_EVAL_STDERR"], file=sys.stderr)
 if code:
     print("boom from the stand-in client", file=sys.stderr)
     sys.exit(code)

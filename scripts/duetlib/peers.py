@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -16,9 +17,20 @@ DEFAULT_TIMEOUT_SECONDS = 2400
 ERROR_TAIL_CHARS = 1500
 KILL_GRACE_SECONDS = 5
 BIN_ENV = {"codex": "DUET_CODEX_BIN", "claude": "DUET_CLAUDE_BIN"}
-OTHER_LAB_SECRETS = {"codex": ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"), "claude": ("OPENAI_API_KEY",)}
-COMMON_SECRETS = ("OPENROUTER_API_KEY", "GITHUB_TOKEN", "GH_TOKEN", "AWS_SECRET_ACCESS_KEY",
-                  "AWS_SESSION_TOKEN", "NPM_TOKEN", "PYPI_TOKEN", "HF_TOKEN")
+OTHER_LAB_SECRETS = {
+    "codex": ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"),
+    "claude": ("OPENAI_API_KEY", "CODEX_API_KEY"),
+}
+COMMON_SECRETS = ("OPENROUTER_API_KEY", "GITHUB_TOKEN", "GH_TOKEN", "GITLAB_TOKEN", "AWS_SECRET_ACCESS_KEY",
+                  "AWS_SESSION_TOKEN", "AWS_BEARER_TOKEN_BEDROCK", "NPM_TOKEN", "PYPI_TOKEN", "HF_TOKEN")
+SECRET_SUFFIXES = ("_TOKEN", "_SECRET", "_API_KEY", "_PASSWORD")  # dropped by name unless the client's own
+# Names each client reads to sign in or reach its own service; these stay even though they look secret.
+OWN_PREFIXES = {"codex": ("OPENAI_", "CODEX_"), "claude": ("ANTHROPIC_", "CLAUDE_")}
+BEDROCK_SWITCH = "CLAUDE_CODE_USE_BEDROCK"  # a Claude client on Bedrock signs in with AWS credentials
+BEDROCK_NAMES = ("AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_BEARER_TOKEN_BEDROCK")
+SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")  # never option-like: it goes on a command line
+BAD_SESSION = ("the peer client reported a session id that cannot be used safely on a command line; "
+               "the reply was discarded and no session was kept")
 CLAUDE_FOLDER = ".claude"
 CLAUDE_EDIT_TOOLS = ("Edit", "Write", "NotebookEdit")
 
@@ -39,7 +51,8 @@ def launch_problem(peer: str) -> Optional[str]:
     if peer == "claude" and os.environ.get("CODEX_SANDBOX_NETWORK_DISABLED") == "1":
         return ("the Codex sandbox this command runs in has no network access, so the Claude client cannot "
                 "be reached. Start Codex with network access and a writable ~/.claude, for example: "
-                "codex -c 'sandbox_workspace_write.network_access=true' --add-dir ~/.claude")
+                "codex -c 'sandbox_workspace_write.network_access=true' --add-dir ~/.claude "
+                "--add-dir ~/.local/state/duet")
     return None
 
 
@@ -114,6 +127,20 @@ def _claude_command(session: Optional[str], write: bool, model: Optional[str], u
     return command
 
 
+def _count(value: Any) -> int:
+    """A token count from client output; anything that is not a plain number counts as zero."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    try:
+        return max(0, int(value))
+    except (ValueError, OverflowError):
+        return 0
+
+
+def usable_session(value: Any) -> bool:
+    return isinstance(value, str) and bool(SESSION_RE.match(value))
+
+
 def _parse_codex(events: str, last: Path) -> PeerResult:
     session: Optional[str] = None
     replies: List[str] = []
@@ -129,14 +156,18 @@ def _parse_codex(events: str, last: Path) -> PeerResult:
             session = event.get("thread_id") or session
         if event.get("type") == "turn.completed" and isinstance(event.get("usage"), dict):
             raw = event["usage"]
-            usage = {"input_tokens": int(raw.get("input_tokens") or 0),
-                     "output_tokens": int(raw.get("output_tokens") or 0)}
+            usage = {"input_tokens": _count(raw.get("input_tokens")),
+                     "output_tokens": _count(raw.get("output_tokens"))}
         item = event.get("item")
         if not isinstance(item, dict):
             continue
-        if event.get("type") == "item.completed" and item.get("type") == "agent_message":
-            replies.append(item.get("text", ""))
-    reply = last.read_text(encoding="utf-8") if last.is_file() else ""
+        if (event.get("type") == "item.completed" and item.get("type") == "agent_message"
+                and isinstance(item.get("text"), str)):
+            replies.append(item["text"])
+    try:
+        reply = last.read_text(encoding="utf-8", errors="replace") if last.is_file() else ""
+    except OSError:
+        reply = ""
     if not reply.strip() and replies:
         reply = replies[-1]
     return PeerResult(ok=bool(reply.strip()), reply=reply.strip(), session=session,
@@ -157,13 +188,14 @@ def _parse_claude(output: str) -> PeerResult:
         return PeerResult(False, "", None, "the peer's output was not JSON")
     if not isinstance(data, dict):
         return PeerResult(False, "", None, "the peer's output was not a JSON object")
-    reply = str(data.get("result") or "").strip()
+    reply = data["result"].strip() if isinstance(data.get("result"), str) else ""
     if data.get("is_error") or not reply:
         return PeerResult(False, "", data.get("session_id"), reply or "the peer reported an error")
     raw = data.get("usage") if isinstance(data.get("usage"), dict) else {}
     cost = data.get("total_cost_usd")
-    usage = {"input_tokens": int(raw.get("input_tokens") or 0), "output_tokens": int(raw.get("output_tokens") or 0),
-             "cost_usd": float(cost) if isinstance(cost, (int, float)) else 0.0}
+    spent = float(cost) if isinstance(cost, (int, float)) and not isinstance(cost, bool) else 0.0
+    usage = {"input_tokens": _count(raw.get("input_tokens")), "output_tokens": _count(raw.get("output_tokens")),
+             "cost_usd": spent if 0.0 <= spent < float("inf") else 0.0}
     return PeerResult(True, reply, data.get("session_id"), usage=usage)
 
 
@@ -177,10 +209,22 @@ def _drop_empty_client_folder(workspace: Path) -> None:
 
 
 def peer_env(peer: str) -> Dict[str, str]:
-    """The peer's environment without the other lab's key or common deploy secrets."""
+    """The peer's environment without the other lab's credentials, common deploy secrets, or anything
+    whose name ends like a secret. Kept: what the peer's own client signs in with (its lab's prefixes,
+    AWS credentials for a Claude client on Bedrock) and whatever DUET_KEEP_ENV lists."""
     keep = {name.strip() for name in os.environ.get("DUET_KEEP_ENV", "").split(",") if name.strip()}
-    drop = (set(OTHER_LAB_SECRETS[peer]) | set(COMMON_SECRETS)) - keep
-    return {name: value for name, value in os.environ.items() if name not in drop}
+    if peer == "claude" and os.environ.get(BEDROCK_SWITCH):
+        keep |= set(BEDROCK_NAMES)
+    listed = set(OTHER_LAB_SECRETS[peer]) | set(COMMON_SECRETS)
+
+    def dropped(name: str) -> bool:
+        if name in keep:
+            return False
+        if name in listed:
+            return True
+        return name.upper().endswith(SECRET_SUFFIXES) and not name.upper().startswith(OWN_PREFIXES[peer])
+
+    return {name: value for name, value in os.environ.items() if not dropped(name)}
 
 
 def run_turn(
@@ -198,6 +242,8 @@ def run_turn(
 ) -> PeerResult:
     """Send one message to the peer and wait for its reply. The prompt travels on stdin only."""
     turn_dir.mkdir(parents=True, exist_ok=True)
+    if session is not None and not usable_session(session):
+        return PeerResult(False, "", None, BAD_SESSION)
     last, out_path, err_path = turn_dir / "last.txt", turn_dir / "stdout.txt", turn_dir / "stderr.txt"
     (turn_dir / "prompt.md").write_text(prompt, encoding="utf-8")
     command = _codex_command(session, write, model, effort, last) if peer == "codex" else _claude_command(session, write, model, user_config, workspace, hidden)
@@ -214,12 +260,18 @@ def run_turn(
             except subprocess.TimeoutExpired:
                 timed_out = True
                 stop_group(child, KILL_GRACE_SECONDS)
+            except BaseException:
+                # The runner itself is being stopped (a signal, Ctrl-C): the peer must not outlive it.
+                stop_group(child, KILL_GRACE_SECONDS)
+                raise
     except OSError as exc:
         return PeerResult(False, "", session, f"could not start {command[0]}: {exc}")
     if peer == "claude" and not had_client_folder:
         _drop_empty_client_folder(workspace)
     output = out_path.read_text(encoding="utf-8", errors="replace")
     parsed = _parse_codex(output, last) if peer == "codex" else _parse_claude(output)
+    if parsed.session is not None and not usable_session(parsed.session):
+        return PeerResult(False, "", session, BAD_SESSION)
     kept = parsed.session or session
     if timed_out:
         return PeerResult(False, "", kept, f"the peer timed out after {timeout}s; its work may be partly done")
