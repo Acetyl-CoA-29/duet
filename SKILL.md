@@ -1,7 +1,7 @@
 ---
 name: duet
 description: "Two top models, one conversation, one build: you (the host model) and a peer model from the other lab (Codex for a Claude host, Claude for a Codex host) frame a goal, write blind independent proposals, agree on a joint plan, then build, test and iterate together until an agreed acceptance command passes and the non-author approves. Use when asked to run a duet, to have Claude and Codex or GPT work or build together, to pair or debate with the other model, or for a two-model build loop. Not for a one-shot second opinion."
-version: 1.7.0
+version: 1.8.0
 ---
 
 # Duet
@@ -125,6 +125,38 @@ changed files since they were last fully approved, both of you when both have (o
 was changed). An edit of yours before a peer build turn still counts as yours. Any later edit
 reopens the gate. `D status --run <run>` lists the current phase, what is still blocking, who the
 writers are, and what the peer has cost.
+
+## The engineering standard
+
+The peer is given this standard in every run, and you are held to it too. It outranks speed: a
+duet exists to produce the strongest result, so take the long way whenever the long way is sturdier.
+
+- **Work as a CTO and head of engineering would.** Both of you act as the CTO and the head of
+  engineering of a top software company with your own names on the result: own the outcome, weigh
+  trade-offs out loud (correctness, security, operability, cost of later change), push back on a
+  requirement or plan that will not hold up, and build for the people who will run and maintain
+  it. If you would not sign it off in a production code review there, it is not done.
+- **Strongest route, not quickest.** Turns and effort are not the scarce thing; a result that
+  holds under pressure is. Never trade robustness for finishing sooner.
+- **Finish what you start.** No stubs, placeholders, TODOs standing in for behaviour, hard-coded
+  answers, code shaped to the tests, or commented-out leftovers. What cannot be done is named as
+  a gap in your build message and in the final report.
+- **The unhappy path counts as much as the happy one:** empty, huge, malformed and hostile input;
+  failing or stalled files, networks and dependencies; partial failure, timeouts, concurrency and
+  resource limits wherever the goal can meet them. Errors are handled or raised clearly, never swallowed.
+- **Fix causes, not symptoms.** No sleeps, retries or broad catches to hide a defect; never weaken
+  a test or the acceptance command to get a pass.
+- **Tests must be able to fail,** and must cover boundaries and failure paths.
+- **Strong is not big.** No speculative features, options or layers; follow the repository's
+  conventions; pick the simplest design that survives the failure cases.
+
+Apply it by phase: in `frame`, agree which pressures the result must survive and make the
+acceptance command exercise failure paths; in `propose`, list the failure modes your design
+survives; in `plan`, prefer the more robust proposal unless evidence shows the simpler is equally
+safe, and make error handling and its tests planned tasks; in `review`, try to break the other's
+work and give `revise` for any stub, swallowed error, masked defect, test that cannot fail, or
+needless complexity. If the user asks for a quick draft or prototype, say so in the goal file;
+otherwise this standard is the default and is not relaxed to save turns.
 
 ## How to argue well
 

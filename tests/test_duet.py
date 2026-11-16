@@ -1932,6 +1932,47 @@ def test_review_prompt_requires_observed_evidence_and_regressions(first):
     assert "Do not edit, create or delete source files" in prompt
 
 
+def test_every_run_opens_with_the_engineering_standard_and_each_phase_applies_it():
+    from duetlib import prompts
+    state = {"peer": "codex", "host": "claude", "accept_cmd": "python3 -m pytest -q", "nonce": "ab12"}
+    opening = prompts.build_prompt(state, "Build a greeter.", "frame", [], False, True)
+    assert "Engineering standard" in opening and "{standard}" not in opening
+    for phrase in ("as the CTO and the head of engineering of a top software company", "Decide like an owner",
+                   "Hold the bar of a production code review",
+                   "strongest result, not the quickest", "No stubs, placeholders", "never swallowed",
+                   "Fix causes, not symptoms", "Tests must be able to fail", "Strong is not the same as big"):
+        assert phrase in opening
+    assert "make acceptance exercise failure paths" in prompts.PHASE_NOTES["frame"]
+    assert "the failure modes it must survive" in prompts.PHASE_NOTES["propose"]
+    assert "do not defer the hard parts" in prompts.PHASE_NOTES["plan"]
+    assert "no stubs or placeholders" in prompts.PHASE_NOTES["build"]
+    assert "the trade-offs you weighed" in prompts.PHASE_NOTES["propose"]
+    assert "sign this off for production" in prompts.PHASE_NOTES["review"]
+    assert "Try to break it" in prompts.PHASE_NOTES["review"]
+    assert "working on the happy path is not grounds for approval" in prompts.PHASE_NOTES["review"]
+
+
+@pytest.mark.parametrize("phase,write,reminded", [("build", True, True), ("review", False, True),
+                                                  ("plan", False, False)])
+def test_later_build_and_review_turns_repeat_the_standard(phase, write, reminded):
+    from duetlib import prompts
+    state = {"peer": "claude", "host": "codex", "accept_cmd": "true", "nonce": "ab12"}
+    later = prompts.build_prompt(state, "Build a greeter.", phase, [], write, False)
+    assert ("The engineering standard still applies" in later) is reminded
+    assert "Engineering standard (it applies" not in later
+    first = prompts.build_prompt(state, "Build a greeter.", phase, [], write, True)
+    assert "The engineering standard still applies" not in first
+
+
+def test_skill_instructions_hold_the_host_to_the_same_standard():
+    skill = (Path(__file__).resolve().parents[1] / "SKILL.md").read_text()
+    assert "## The engineering standard" in skill
+    for phrase in ("Work as a CTO and head of engineering would", "Strongest route, not quickest",
+                   "Finish what you start", "Fix causes, not symptoms",
+                   "Tests must be able to fail", "Strong is not big"):
+        assert phrase in skill
+
+
 def test_review_turns_restate_the_goal_and_the_ground_rules(env, capsys):
     run = start(env, capsys, "--accept", "true")
     nonce = st.load_state(run)["nonce"]

@@ -100,6 +100,21 @@ would change it.
 `experiment --cmd "..."` runs a command the two models agreed would settle a disagreement and
 puts its output into the conversation.
 
+### The engineering standard
+
+Both models are told, in every run and again on each build and review turn, to work as the CTO and
+the head of engineering of a top software company would with their own names on the result, and
+to build the long way: the strongest route rather than the quickest, nothing left as a stub or placeholder, failure
+paths handled as carefully as the happy path, causes fixed rather than masked, tests that can
+fail, and no complexity the goal does not need. Each phase applies it: the frame agrees which
+pressures the result must survive, proposals list the failure modes they handle, the plan makes
+error handling and its tests explicit tasks, and the reviewer is told to try to break the work
+and to refuse anything that only works on the happy path. The full text is `STANDARD` in
+`scripts/duetlib/prompts.py` and the matching section of `SKILL.md`.
+
+This is an instruction to both models, backed by the review gate (the other model must approve
+the final files); the runner does not itself measure code quality.
+
 ### Stop conditions
 
 - **Turn cap**: 30 peer turns by default (`--max-turns`), failed and interrupted turns included;
