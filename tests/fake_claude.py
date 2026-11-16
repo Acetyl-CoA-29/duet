@@ -11,7 +11,9 @@ if log:
     with open(log, "a", encoding="utf-8") as fh:
         fh.write(json.dumps({"argv": argv, "stdin": stdin, "cwd": os.getcwd(),
                              "secrets": sorted(k for k in os.environ if k.endswith(("_KEY", "_TOKEN")))}) + "\n")
+model = os.environ.get("FAKE_MODEL")
 print(json.dumps({
+    **({"modelUsage": {"claude-helper-mini": {"outputTokens": 3}, model: {"outputTokens": 900}}} if model else {}),
     "type": "result",
     "is_error": bool(os.environ.get("FAKE_IS_ERROR")),
     "result": os.environ.get("FAKE_REPLY", "Looks right.\nVERDICT: APPROVE"),

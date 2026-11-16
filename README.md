@@ -38,7 +38,10 @@ two participants instead of a council, and they build the thing rather than only
   `<workspace>/.duet/<run-id>` instead. Both locations use the integrity record described below.
 - **Models** are not hardcoded. The host is whatever model you are running; the peer uses its
   client's configured default unless you pass `--peer-model`. Defaults do not guarantee the
-  latest or strongest model; select the intended models in each client and report them honestly.
+  latest or strongest model. `status` and the finish message list both models with how each is
+  known: the Claude client reports the model it ran; the Codex client does not, so a Codex model
+  is shown as requested (`--peer-model`), as the client's configured default when the run
+  started, or as not known. The host states its own with `--host-model`.
 
 ### The loop
 
@@ -82,7 +85,10 @@ The rest of the rules, each one line:
   and `finish` is refused while the run sits in plan. Replanning requires fresh reviews too.
 - `check` runs the acceptance command and `experiment` runs an agreed command; both work in any
   phase, cost no peer turn and do not move the run. (There is no separate test phase.)
-- You can speak in any phase (`say --speaker user`); your words never move the run.
+- You can speak in any phase (`say --speaker user`); your words never move the run. Only a
+  message recorded with `--settle` ends a plan disagreement and opens build. Anything you say
+  after a review makes it stale: both models must review again, the peer after being sent your
+  words, before the run can finish.
 - A failed or timed-out peer turn does not move the run. Its record says whether workspace files
   changed during it, because a turn can finish its work and still fail to report back.
 - `--skip-proposals "<reason>"` at `init` lets a run go from frame straight to plan or build.
@@ -273,7 +279,7 @@ approvals before resuming build:
 $D say  --run <run> --phase plan --replan "the API has no prefix scan" --file <run>/drafts/replan.md
 ```
 
-Other options: `--peer claude` (when the host is Codex), `--peer-model`, `--peer-effort`
+Other options: `--peer claude` (when the host is Codex), `--peer-model`, `--host-model`, `--peer-effort`
 (Codex reasoning effort for the run), `--peer-user-config` (Claude peer), `--max-cost`,
 `--skip-proposals "<reason>"`, `peer --new-session`, `--waive-accept "<reason>"`, `--accept-later`
 (the frame phase must then set the command), `accept --cmd "<command>"` or `accept --waive

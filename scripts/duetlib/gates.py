@@ -409,7 +409,8 @@ def review_standing(messages: List[Message], speaker: str, after_seq: int) -> Tu
     if latest["meta"].get("verdict") != "approve":
         return latest, f"{speaker}'s latest review verdict is not an approval that counts"
     if min(latest["seq"], latest["meta"].get("observed_seq", latest["seq"])) < after_seq:
-        return latest, (f"{speaker} approved before the last acceptance run or a newer plan/criteria change; "
+        return latest, (f"{speaker} approved before the last acceptance run, a newer plan/criteria change, or a "
+                        f"later message from the user; "
                         f"{speaker} must review again after receiving that evidence")
     return latest, ""
 
@@ -434,7 +435,10 @@ def current_writer(state: State, current: str) -> Optional[str]:
 def review_boundary(state: State, messages: List[Message]) -> int:
     """Evidence and decisions the reviewers must have received before approving."""
     check = 0 if state.get("accept_waived") else (state.get("last_check") or {}).get("seq", 0)
-    return max([check] + [m["seq"] for m in messages if m["kind"] in ("accept", "replan", "command_error")])
+    moved = [m["seq"] for m in messages if m["kind"] in ("accept", "replan", "command_error")]
+    # Anything the user says may change what is wanted, so reviews given before it are stale.
+    said = [m["seq"] for m in messages if m["speaker"] == "user" and m["kind"] == "message"]
+    return max([check] + moved + said)
 
 
 def finish_report(state: State, messages: List[Message], current: Optional[str] = None) -> Tuple[bool, List[str]]:

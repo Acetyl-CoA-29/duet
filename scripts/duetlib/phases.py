@@ -70,11 +70,12 @@ def _plan_refusal(state: State, messages: List[Message]) -> Optional[str]:
     if not unagreed:
         return None
     last_objection = max(m["seq"] for m in unagreed)
-    if any(m["speaker"] == "user" and m["kind"] == "message" and m["seq"] > last_objection for m in messages):
-        return None
+    if any(m["speaker"] == "user" and m["kind"] == "message" and (m.get("meta") or {}).get("settles")
+           and m["seq"] > last_objection for m in messages):
+        return None  # only an explicit decision settles it: other words from the user do not
     names = " and ".join(sorted(m["speaker"] for m in unagreed))
     return (f"build opens once each model's latest plan message ends in an approve verdict (not yet: {names}), "
-            "or the user has settled the disagreement (`say --speaker user`)")
+            "or the user has settled the disagreement (`say --speaker user --settle`)")
 
 
 def _forward_refusal(state: State, messages: List[Message], here: str, target: str) -> Optional[str]:

@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
-from . import authors, base, gates, peers, phases, prompts, snapshot, store
+from . import authors, base, gates, models, peers, phases, prompts, snapshot, store
 from . import state as st
 from .base import (EXIT_BLIND, EXIT_CAP, EXIT_OK, EXIT_ORDER, EXIT_PEER_FAILED, EXIT_READONLY_BROKEN, EXIT_STALLED,
                    EXIT_USAGE, FINISHED_TEXT, emit, warn)
@@ -413,6 +413,7 @@ def _record(run: Path, args: argparse.Namespace, state: st.State, messages: List
             "pending_turn": None, "peer_session": kept, "last_peer_failed": primed,
             "peer_replay": replay, "peer_turns": fresh["peer_turns"] + 1,
             **_usage_change(fresh, result.session or session, result.usage),
+            **models.seen_change(result.model),
             **_authorship(pending, after, messages, fresh)})
         if violation:
             st.append_message(run, "system", args.phase, violation, kind="readonly_violation")
@@ -432,6 +433,7 @@ def _record(run: Path, args: argparse.Namespace, state: st.State, messages: List
         "pending_turn": None, "peer_session": result.session, "peer_replay": False,
         "peer_cursor": messages[-1]["seq"] if messages else 0, "withheld": ready["delta_held"],
         "peer_turns": fresh["peer_turns"] + 1, **_usage_change(fresh, result.session, result.usage),
+        **models.seen_change(result.model),
         "last_peer_failed": False, "peer_primed": True, "phase": current_phase if superseded else args.phase,
         **_authorship(pending, after, messages, fresh)})
     if args.phase == "propose":

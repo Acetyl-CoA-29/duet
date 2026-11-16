@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from . import models
 from .gates import stop_group
 
 DEFAULT_TIMEOUT_SECONDS = 2400
@@ -65,6 +66,7 @@ class PeerResult:
     session: Optional[str]
     error: str = ""
     usage: Optional[Dict[str, Any]] = None
+    model: Optional[str] = None
 
 
 def _codex_command(session: Optional[str], write: bool, model: Optional[str], effort: Optional[str], last: Path) -> List[str]:
@@ -225,9 +227,10 @@ def _parse_claude(output: str) -> PeerResult:
     # A huge JSON integer must not crash recovery or turn a reported bill into zero spend.
     spent = float(min(cost, sys.float_info.max)) if valid_cost else 0.0
     usage = {**_token_usage(data.get("usage")), "cost_usd": spent}
+    model = models.reported_by_claude(data)
     if data.get("is_error") or not reply:
-        return PeerResult(False, "", data.get("session_id"), reply or "the peer reported an error", usage)
-    return PeerResult(True, reply, data.get("session_id"), usage=usage)
+        return PeerResult(False, "", data.get("session_id"), reply or "the peer reported an error", usage, model)
+    return PeerResult(True, reply, data.get("session_id"), usage=usage, model=model)
 
 
 def saved_result(peer: str, turn_dir: Path) -> PeerResult:
@@ -323,4 +326,4 @@ def run_turn(
     if parsed.ok and not kept:
         return PeerResult(False, "", None, "the peer replied without a session id, so the conversation "
                                            "could not be continued; its reply was discarded", parsed.usage)
-    return PeerResult(parsed.ok, parsed.reply, kept, parsed.error, parsed.usage)
+    return PeerResult(parsed.ok, parsed.reply, kept, parsed.error, parsed.usage, parsed.model)

@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from . import authors, base, gates, operations, peers, phases, store, turn
+from . import authors, base, gates, models, operations, peers, phases, store, turn
 from . import state as st
 from .base import (EXIT_BLIND, EXIT_CAP, EXIT_CHECK_FAILED, EXIT_INTERNAL, EXIT_NOT_DONE,  # noqa: F401 - re-exported
                    EXIT_OK, EXIT_ORDER, EXIT_PEER_FAILED, EXIT_READONLY_BROKEN, EXIT_STALLED, EXIT_TAMPERED,
@@ -54,12 +54,17 @@ def cmd_init(args: argparse.Namespace) -> int:
     problem = peers.launch_problem(args.peer)
     if problem:
         raise st.DuetError(problem)
+    for flag, value in (("--peer-model", args.peer_model), ("--host-model", args.host_model)):
+        if value is not None and not models.clean(value):
+            raise st.DuetError(f"{flag} does not look like a model name: {value!r}")
     run = st.new_run(
         Path(args.workspace), _read_text(args.goal_file), args.peer,
         args.accept, args.waive_accept, args.max_turns, args.peer_model, args.peer_effort,
         args.peer_user_config, args.max_cost, args.skip_proposals,
         gates.fingerprint(Path(args.workspace)) if Path(args.workspace).is_dir() else None,
     )
+    base.update(run, lambda fresh: {"host_model": args.host_model,
+                                    "peer_model_configured": models.configured_for(args.peer)})
     own_key = {"codex": "OPENAI_API_KEY", "claude": "ANTHROPIC_API_KEY"}[args.peer]
     if os.environ.get(own_key):
         warn(f"{own_key} is set in this environment: the {args.peer} client may bill that API key "
@@ -78,6 +83,8 @@ def cmd_say(args: argparse.Namespace) -> int:
         raise st.DuetError(f"--speaker must be '{state['host']}' or 'user'; the peer speaks through `peer`")
     if args.verdict and speaker != state["host"]:
         raise st.DuetError("only the host model records a verdict with `say`")
+    if args.settle and speaker != "user":
+        raise st.DuetError("--settle records the user's decision on a plan disagreement: use it with --speaker user")
     messages = st.read_messages(run)
     here = phases.current(state, messages)
     peer_proposed = any(m["speaker"] == state["peer"] and m["phase"] == "propose" for m in messages)
@@ -98,6 +105,8 @@ def cmd_say(args: argparse.Namespace) -> int:
     text = _read_text(args.file)
     current = gates.fingerprint(Path(state["workspace"]))
     meta: Dict[str, Any] = {"verdict": args.verdict, "fingerprint": current} if args.verdict else {}
+    if args.settle:
+        meta["settles"] = True
     sealed = speaker == state["host"] and phase == phases.PROPOSE
     if phase != here and args.replan:
         turn.record_replan(run, here, args.replan)
@@ -285,7 +294,7 @@ def _report(run: Path) -> Dict[str, Any]:
         "phase": "done" if done else here,
         "allowed_next": [] if done else phases.allowed_next(state, messages),
         "with_replan": [] if done else phases.needs_replan(state, messages),
-        "host": state["host"], "peer": state["peer"],
+        "host": state["host"], "peer": state["peer"], "models": models.identities(state),
         "peer_session": state["peer_session"], "peer_turns": state["peer_turns"],
         "max_turns": state["max_turns"], "messages": len(messages), "peer_turn": running,
         "pending_command": state.get("pending_command"),
@@ -322,7 +331,7 @@ def cmd_finish(args: argparse.Namespace) -> int:
     summary = _finish_summary(report)
     st.append_message(run, "system", report["phase"], f"Run finished: {summary}.", kind="finish",
                       change=lambda fresh, seq: {"status": "done"})
-    emit(f"Finished: {summary}. Transcript: {report['transcript']}")
+    emit(f"Finished: {summary}. Models: {models.line(st.load_state(run))}. Transcript: {report['transcript']}")
     return EXIT_OK
 
 
@@ -382,6 +391,7 @@ def build_parser() -> argparse.ArgumentParser:
                            "(`accept --cmd`) before the run can move on")
     init.add_argument("--peer", default="codex", choices=sorted(st.HOST_FOR_PEER))
     init.add_argument("--peer-model", help="override the peer client's own default model")
+    init.add_argument("--host-model", help="the host's own model name, recorded so reports name both models")
     init.add_argument("--peer-effort", help="Codex reasoning effort for this run; its own default if omitted")
     init.add_argument("--peer-user-config", action="store_true",
                       help="Claude peer only: load your personal Claude setup (hooks, instructions, plugins) "
@@ -401,6 +411,8 @@ def build_parser() -> argparse.ArgumentParser:
     say.add_argument("--speaker")
     say.add_argument("--file", help="file holding the message; stdin if omitted")
     say.add_argument("--verdict", choices=("approve", "revise"))
+    say.add_argument("--settle", action="store_true",
+                     help="with --speaker user: the user's decision that ends a plan disagreement and opens build")
     say.set_defaults(func=cmd_say)
 
     peer = sub.add_parser("peer", help="give the peer everything new and record its reply")

@@ -1,7 +1,7 @@
 ---
 name: duet
 description: "Two top models, one conversation, one build: you (the host model) and a peer model from the other lab (Codex for a Claude host, Claude for a Codex host) frame a goal, write blind independent proposals, agree on a joint plan, then build, test and iterate together until an agreed acceptance command passes and the non-author approves. Use when asked to run a duet, to have Claude and Codex or GPT work or build together, to pair or debate with the other model, or for a two-model build loop. Not for a one-shot second opinion."
-version: 1.8.0
+version: 1.9.0
 ---
 
 # Duet
@@ -24,8 +24,9 @@ stop; for failed turns follow exit 5 below. Do not continue alone and call it a 
    plan, and that the peer will get write access to the workspace during build turns. If they
    named a budget, pass it as `--max-turns` and, for a Claude peer, `--max-cost <dollars>`.
    The peer runs its client's configured default model unless you pass `--peer-model <name>`
-   (and `--peer-effort`); the runner does not check that the default is the top model, so pass
-   the model the user named, or say that the default is being used.
+   (and `--peer-effort`); pass the model the user named. Always pass `--host-model <your own
+   model name>`. After `init`, `D status` lists both under `models`, each with how it is known
+   (the Codex client never reports the model it ran): tell the user exactly that, not a guess.
 2. Pick the workspace (the project directory). Runs default to
    `~/.local/state/duet/runs/<run-id>/` (`DUET_HOME` moves it). Integrity checks detect record edits;
    location alone does not prevent access.
@@ -105,7 +106,7 @@ cannot follow it (exit 6; the message lists what is allowed now, and so does `st
 | `frame` | Agree what "done" means, run the baseline as above, and settle acceptance. Keep solution designs for the blind round. | Only at the start. The acceptance command locks when the run leaves it. |
 | `propose` | Inspect repository constraints; record your design, three independent input/expected-output cases from the requirements, and your riskiest assumption, then ask the peer for theirs. | The peer is refused until yours is recorded. Yours is withheld and stored encoded until the peer has proposed; after that you cannot propose again. |
 | `plan` | Identify consequential differences and the evidence that would decide them; combine compatible parts. Do not invent disagreement; say when none is material. Agree on ordered tasks with a driver and reviewer each. By default, the non-implementer writes each piece's tests in a build turn from the blind proposal cases (or requirements if skipped). Explain changed expectations and any exception to the split. Both give a verdict. | Once both proposals exist. |
-| `build` | One driver at a time. You drive: edit, then `say` the task, changed files, checks/results and gaps. Peer drives: first `say --phase build` naming one task, then `peer --phase build --write`. If the task or approved plan is ambiguous, ask before editing. | Once each model's latest plan message approves, or the user settles the disagreement with `say --speaker user`. `--write` is accepted only here. |
+| `build` | One driver at a time. You drive: edit, then `say` the task, changed files, checks/results and gaps. Peer drives: first `say --phase build` naming one task, then `peer --phase build --write`. If the task or approved plan is ambiguous, ask before editing. | Once each model's latest plan message approves, or the user settles the disagreement with `say --speaker user --settle`. `--write` is accepted only here. |
 | `review` | Inspect the other's current files and test the highest-risk uncovered requirement. Separate observations from reasoning; retain accepted counterexamples as regression tests in a build turn. List every test/check file changed since the plan, explain changed expectations and removed/loosened assertions, and note when a planned test/implementation split did not happen. | After `build` only. Only review verdicts count toward finish; self-approval is neither needed nor counted. |
 
 - `build` and `review` alternate freely: that is the iterate loop.
@@ -115,7 +116,10 @@ cannot follow it (exit 6; the message lists what is allowed now, and so does `st
   `build` or `review`. Replanning also requires fresh reviews of the resulting work.
 - `check` (the acceptance command) and `experiment` work in any phase, cost no peer turn, and
   do not move the run. There is no test phase: run `check` after each build step unless waived.
-- The user can speak in any phase (`say --speaker user`, no `--phase` needed).
+- The user can speak in any phase (`say --speaker user`, no `--phase` needed). Only `--settle`
+  on their message ends a plan disagreement; use it for their explicit decision, never for other
+  remarks. Anything the user says makes earlier reviews stale: both of you review again, and the
+  peer must have been sent their words, before `finish`.
 - A failed peer turn does not move the run.
 
 **Settling a disagreement by evidence:** when the two of you agree a command would decide it,
@@ -200,7 +204,8 @@ Full meanings and recovery: [README.md](README.md#exit-codes).
 ## Before you report
 
 Run `D status --run <run>` and report from it, not from memory: whether the run finished, the
-acceptance command and its last result, who changed the files and who approved them, the
+models that took part and how each is known, the acceptance command and its last result, who
+changed the files and who approved them, the
 number of peer turns and reported cost, anything conceded or left unresolved, and the path of
 `conversation.md`. If `finish` did not succeed, say that plainly and list what is blocking.
 Never describe a run as agreed or complete when the gate did not pass.

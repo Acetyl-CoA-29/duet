@@ -1770,7 +1770,12 @@ def test_build_waits_for_both_plan_approvals_or_the_user(env, capsys, monkeypatc
     assert cli.main(["peer", "--run", str(run), "--phase", "plan"]) == 0
     assert say(env, run, "Fine, the trie.", "--phase", "plan", "--verdict", "approve") == 0
     assert cli.main(["peer", "--run", str(run), "--phase", "build", "--write"]) == cli.EXIT_ORDER  # codex has not agreed
-    assert say(env, run, "Use the trie; stop arguing.", "--speaker", "user") == 0
+    assert say(env, run, "Unrelated: please also update the changelog.", "--speaker", "user") == 0
+    assert status(run, capsys)["allowed_next"] == ["plan"]  # the user spoke, but did not settle it
+    assert say(env, run, "Building.", "--phase", "build") == cli.EXIT_ORDER
+    assert "say --speaker user --settle" in capsys.readouterr().err
+    assert say(env, run, "I settle it.", "--phase", "plan", "--settle") == cli.EXIT_USAGE  # not the host's to settle
+    assert say(env, run, "Use the trie; stop arguing.", "--speaker", "user", "--settle") == 0
     assert status(run, capsys)["allowed_next"] == ["plan", "build"]
     assert say(env, run, "Building.", "--phase", "build") == 0
 

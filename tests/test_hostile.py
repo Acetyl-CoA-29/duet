@@ -554,7 +554,7 @@ def test_every_illegal_move_is_refused_at_every_state(env, capsys):
     assert_only(env, run, capsys, "propose", ("propose",))
     assert peer(run, "propose") == 0
     assert_only(env, run, capsys, "propose", ("propose", "plan"))
-    assert say(env, run, "Take theirs.", "--phase", "plan") == 0
+    assert say(env, run, "Take theirs.", "--phase", "plan", "--verdict", "approve") == 0
     assert_only(env, run, capsys, "plan", ("plan",))
     assert peer(run, "plan") == 0
     assert_only(env, run, capsys, "plan", ("plan", "build"))
