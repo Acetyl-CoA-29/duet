@@ -1,0 +1,20 @@
+{
+  "description": "Maps a requested URL path onto a file inside the public folder of a small static file server and picks its content type. A request must never resolve to a file outside the public folder; such a request raises Forbidden.",
+  "key": {
+    "class": "path-check-bypass",
+    "lines": [
+      [
+        35,
+        35
+      ]
+    ],
+    "statement": "The containment check is a bare string prefix test, so a sibling folder whose name starts with the root's name (public-backup next to public) passes it.",
+    "keywords": [
+      "prefix",
+      "startswith",
+      "sibling",
+      "separator|os\\.sep|trailing slash",
+      "public[-_]"
+    ]
+  }
+}

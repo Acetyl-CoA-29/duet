@@ -1,0 +1,20 @@
+{
+  "description": "Shares a whole number of cents between parties in proportion to whole-number weights. The shares always add up to the total exactly: cents left over by rounding down go one each to the parties with the largest remainders. With no parties, or with weights that are all zero, there is nobody to pay and the result is an empty mapping.",
+  "key": {
+    "class": "empty-or-degenerate-input",
+    "lines": [
+      [
+        25,
+        27
+      ]
+    ],
+    "statement": "allocate divides by the sum of the weights without checking it, so weights that are all zero raise ZeroDivisionError instead of giving an empty mapping.",
+    "keywords": [
+      "zero ?division|division by zero|divide by zero|divides by zero",
+      "all[- ]zero|all zeros|sum(s)? to (zero|0)|(sum|total) (is|of) (zero|0)",
+      "weight_sum (is|==|of|being) ?(0|zero)",
+      "zerodivisionerror",
+      "modulo by zero"
+    ]
+  }
+}

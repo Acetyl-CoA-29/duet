@@ -435,7 +435,7 @@ def current_writer(state: State, current: str) -> Optional[str]:
 def review_boundary(state: State, messages: List[Message]) -> int:
     """Evidence and decisions the reviewers must have received before approving."""
     check = 0 if state.get("accept_waived") else (state.get("last_check") or {}).get("seq", 0)
-    moved = [m["seq"] for m in messages if m["kind"] in ("accept", "replan", "command_error")]
+    moved = [m["seq"] for m in messages if m["kind"] in ("accept", "replan", "command_error", "justify")]
     # Anything the user says may change what is wanted, so reviews given before it are stale.
     said = [m["seq"] for m in messages if m["speaker"] == "user" and m["kind"] == "message"]
     return max([check] + moved + said)

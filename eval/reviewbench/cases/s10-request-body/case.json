@@ -1,0 +1,20 @@
+{
+  "description": "Reads and decodes a JSON request body from a stream, refusing bodies over a size limit. The sender's declared length cannot be trusted, so the limit applies to what is actually read, and no more than the limit plus one byte may ever be held in memory.",
+  "key": {
+    "class": "huge-input",
+    "lines": [
+      [
+        21,
+        21
+      ]
+    ],
+    "statement": "read_body reads the entire stream into memory before checking the limit, so an oversized or endless body exhausts memory instead of being refused.",
+    "keywords": [
+      "unbounded",
+      "(entire|whole|full|all of the|complete) (stream|body|request|payload|input)",
+      "memory",
+      "before (checking|the (size|limit|check)|enforcing|comparing)",
+      "read\\(\\)"
+    ]
+  }
+}

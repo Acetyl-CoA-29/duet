@@ -1,0 +1,20 @@
+{
+  "description": "A sliding-window rate limiter: each client may make at most `limit` calls in any `window` seconds. `allow` records a permitted call and returns True, or returns False without recording anything; `remaining` and `retry_after` tell a client where it stands.",
+  "key": {
+    "class": "off-by-one",
+    "lines": [
+      [
+        30,
+        30
+      ]
+    ],
+    "statement": "allow refuses only when the count already exceeds the limit, so each client gets limit + 1 calls per window.",
+    "keywords": [
+      "off[- ]by[- ]one",
+      ">=",
+      "limit ?\\+ ?1",
+      "one (more|extra|additional|too many)|an extra (call|request)",
+      "(should|must|needs to) be (>=|at least|greater than or equal)"
+    ]
+  }
+}

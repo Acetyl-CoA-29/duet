@@ -1,0 +1,20 @@
+{
+  "description": "Moves money between accounts in an in-memory ledger of whole cents and returns a new ledger with a receipt; the ledger passed in is never changed. A transfer must move a positive whole number of cents between two different existing accounts and may not overdraw the source.",
+  "key": {
+    "class": "missing-input-validation",
+    "lines": [
+      [
+        29,
+        32
+      ]
+    ],
+    "statement": "transfer never checks that the amount is positive, so a negative amount pulls money from the target into the source.",
+    "keywords": [
+      "negative",
+      "non-?positive",
+      "(less than|below) (or equal to )?zero",
+      "<= ?0|> ?0",
+      "positive"
+    ]
+  }
+}

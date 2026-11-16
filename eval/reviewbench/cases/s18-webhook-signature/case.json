@@ -1,0 +1,20 @@
+{
+  "description": "Verifies that an incoming webhook was signed with the shared secret before its JSON event is accepted. The signature header must be exactly the HMAC-SHA256 signature of the body; a missing, empty or partial signature is refused, as is an event whose timestamp is too old or in the future.",
+  "key": {
+    "class": "authorization-bypass",
+    "lines": [
+      [
+        27,
+        27
+      ]
+    ],
+    "statement": "verify_signature accepts any prefix of the expected signature, so an empty or missing signature header passes verification.",
+    "keywords": [
+      "prefix",
+      "startswith",
+      "empty|missing|blank|absent",
+      "partial|truncat",
+      "compare_digest"
+    ]
+  }
+}

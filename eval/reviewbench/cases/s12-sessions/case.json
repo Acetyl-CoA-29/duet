@@ -1,0 +1,20 @@
+{
+  "description": "Server-side login sessions with an idle timeout given in minutes. A session is created with the full timeout, every use pushes its expiry back by the full timeout, and an expired session is treated as absent. The injected clock returns seconds, like time.time().",
+  "key": {
+    "class": "unit-confusion",
+    "lines": [
+      [
+        27,
+        27
+      ]
+    ],
+    "statement": "create adds the timeout in minutes to a clock in seconds without multiplying by 60, so a new session expires after 30 seconds instead of 30 minutes.",
+    "keywords": [
+      "minutes",
+      "seconds",
+      "unit",
+      "\\* ?60|times 60|60 ?x|by 60",
+      "too (early|soon|short)"
+    ]
+  }
+}

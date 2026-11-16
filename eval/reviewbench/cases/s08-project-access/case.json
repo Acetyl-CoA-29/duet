@@ -1,0 +1,20 @@
+{
+  "description": "Decides whether a user may view, edit or manage a project. The rules, in order of precedence: a deactivated account may do nothing at all; site administrators may do anything; an archived project is view-only for everyone else; members act according to their role; non-members may only view public projects.",
+  "key": {
+    "class": "authorization-bypass",
+    "lines": [
+      [
+        33,
+        37
+      ]
+    ],
+    "statement": "The administrator check runs before the active-account check, so a deactivated administrator keeps full access.",
+    "keywords": [
+      "deactivat",
+      "inactive",
+      "not active|no longer active|isn't active",
+      "disabled|suspended",
+      "active.{0,40}(before|after|first|order|preced)"
+    ]
+  }
+}

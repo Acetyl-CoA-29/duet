@@ -1,0 +1,20 @@
+{
+  "description": "Loads and saves application settings as a JSON file. Loading fills in defaults and rejects bad values. Saving goes through a temporary file and reports whether the new file is in place: True when it was written, False when it could not be written.",
+  "key": {
+    "class": "swallowed-exception",
+    "lines": [
+      [
+        52,
+        52
+      ]
+    ],
+    "statement": "save_settings swallows the OSError from a failed write and still returns True, so a failed save is reported as a success.",
+    "keywords": [
+      "swallow",
+      "silent",
+      "ignor",
+      "suppress",
+      "returns? true"
+    ]
+  }
+}

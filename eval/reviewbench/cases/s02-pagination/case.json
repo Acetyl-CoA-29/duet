@@ -1,0 +1,20 @@
+{
+  "description": "Splits a list of results into numbered pages for a listing endpoint: counts the pages, returns one page with the fields a client needs for page links, and picks the page numbers to show around the current one. An empty listing has exactly one, empty, page.",
+  "key": {
+    "class": "off-by-one",
+    "lines": [
+      [
+        26,
+        26
+      ]
+    ],
+    "statement": "page_count adds a page even when the total is an exact multiple of the page size, so such listings get an extra empty last page.",
+    "keywords": [
+      "off[- ]by[- ]one",
+      "multiple of|% ?(size|page_size) ?== ?0|no remainder|remainder (is|of) (zero|0)",
+      "divisible",
+      "divides? evenly|evenly divi",
+      "(extra|empty|phantom|additional) (empty |trailing |last )?page"
+    ]
+  }
+}

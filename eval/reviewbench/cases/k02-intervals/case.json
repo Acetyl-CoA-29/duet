@@ -1,0 +1,4 @@
+{
+  "description": "Helpers for closed whole-number intervals such as booked time slots in minutes, each given as a (start, end) pair with start <= end. Intervals that overlap or share an endpoint are merged; the helpers also measure the covered length, test a point, and list the free gaps inside a range.",
+  "key": null
+}

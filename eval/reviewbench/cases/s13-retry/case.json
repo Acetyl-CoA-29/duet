@@ -1,0 +1,20 @@
+{
+  "description": "Calls a flaky remote operation again when it fails in a way worth retrying. The operation runs at most `attempts` times in total, whatever kind of retryable failure occurs: after a transient error the wait grows exponentially, after a rate-limit response the wait is what the server asked for (capped). When the last attempt fails, GaveUp is raised. Other exceptions pass straight through.",
+  "key": {
+    "class": "retry-without-bound",
+    "lines": [
+      [
+        41,
+        42
+      ]
+    ],
+    "statement": "A RateLimited failure is retried without being counted against `attempts`, so an operation that keeps being rate limited is retried forever.",
+    "keywords": [
+      "unbounded|unlimited|no (upper )?(bound|limit|cap)|without (a |any )?(bound|limit|cap)",
+      "infinite|forever|indefinite|endless",
+      "never (gives up|give up|stops|terminat|raises gaveup)",
+      "(not|never|isn't|aren't|doesn't|don't|without) (be(ing)? )?(count|increment)",
+      "attempts"
+    ]
+  }
+}

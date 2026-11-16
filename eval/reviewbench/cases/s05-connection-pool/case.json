@@ -1,0 +1,20 @@
+{
+  "description": "Runs read-only SELECT statements on connections borrowed from a small fixed pool and returns rows as dictionaries. A borrowed connection must always go back to the pool, whether or not the query succeeds.",
+  "key": {
+    "class": "resource-leak",
+    "lines": [
+      [
+        49,
+        53
+      ]
+    ],
+    "statement": "fetch_all does not release the connection when the query raises, so every failed query leaks a connection until the pool is exhausted.",
+    "keywords": [
+      "leak",
+      "(never|not|isn't|is not|won't be|will not be) (be )?(released|returned)",
+      "finally",
+      "exhaust",
+      "release.{0,60}(skipp|exception|raise|error|fail)"
+    ]
+  }
+}

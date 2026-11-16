@@ -52,7 +52,8 @@ def start(env, capsys, *args, proposals=False):
     skip = [] if proposals else ["--skip-proposals", "small fixture"]
     acceptance = list(args) if args else ["--accept", "true"]
     assert cli.main(["init", "--workspace", str(env["ws"]), "--goal-file", str(goal),
-                     *skip, *acceptance]) == 0
+                     *skip, *(["--accept-unproven", "small fixture"] if "--accept" in acceptance else []),
+                     *acceptance]) == 0
     run = Path(capsys.readouterr().out.strip().splitlines()[-1])
     assert env["tmp"] in run.parents
     return run

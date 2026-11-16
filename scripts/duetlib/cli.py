@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from . import authors, base, gates, models, operations, peers, phases, store, turn
+from . import authors, base, facts, gates, models, operations, peers, phases, quality, store, turn
 from . import state as st
 from .base import (EXIT_BLIND, EXIT_CAP, EXIT_CHECK_FAILED, EXIT_INTERNAL, EXIT_NOT_DONE,  # noqa: F401 - re-exported
                    EXIT_OK, EXIT_ORDER, EXIT_PEER_FAILED, EXIT_READONLY_BROKEN, EXIT_STALLED, EXIT_TAMPERED,
@@ -63,8 +63,12 @@ def cmd_init(args: argparse.Namespace) -> int:
         args.peer_user_config, args.max_cost, args.skip_proposals,
         gates.fingerprint(Path(args.workspace)) if Path(args.workspace).is_dir() else None,
     )
-    base.update(run, lambda fresh: {"host_model": args.host_model,
-                                    "peer_model_configured": models.configured_for(args.peer)})
+    start = {"host_model": args.host_model, "peer_model_configured": models.configured_for(args.peer),
+             quality.PROOF_KEY: ({"cmd": args.accept, "how": "accepted unproven by the user: " + args.accept_unproven}
+                                 if args.accept and args.accept_unproven else None)}
+    if Path(args.workspace).is_dir():
+        start["facts_digest"] = facts.record_baseline(run, Path(args.workspace))
+    base.update(run, lambda fresh: start)
     own_key = {"codex": "OPENAI_API_KEY", "claude": "ANTHROPIC_API_KEY"}[args.peer]
     if os.environ.get(own_key):
         warn(f"{own_key} is set in this environment: the {args.peer} client may bill that API key "
@@ -180,6 +184,8 @@ def _check(args: argparse.Namespace) -> int:
         if fresh.get("accept_cmd") != state["accept_cmd"]:
             return {**seen, "pending_command": None}  # the replaced command proves nothing now
         return {**seen, "pending_command": None, "fail_streak": gates.next_streak(fresh["fail_streak"], result),
+                **(quality.proof_change(fresh, f"failed at message {seq}")
+                   if result["exit_code"] not in (0, None) else {}),
                 "last_check": {"seq": seq, "passed": result["passed"], "stable": result["stable"],
                                "fingerprint": result["fingerprint"]}}
 
@@ -270,10 +276,17 @@ def cmd_reseal(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _allowed_next(state: st.State, messages: List[st.Message], here: str) -> List[str]:
+    """The phases open now; the run stays in frame until its acceptance command has been seen to fail."""
+    allowed = phases.allowed_next(state, messages)
+    return [p for p in allowed if p == phases.FRAME] if here == phases.FRAME and not quality.proven(state) else allowed
+
+
 def _report(run: Path) -> Dict[str, Any]:
     state = st.load_state(run)
     messages = st.read_messages(run)
-    current = gates.fingerprint(Path(state["workspace"]))
+    files = gates.manifest(Path(state["workspace"]))  # one scan serves the fingerprint and the quality facts
+    current = gates.digest_of(files)
     done = state["status"] != "active"
     here = phases.current(state, messages)
     blocking = gates.finish_report(authors.gate_view(state, messages, current), messages, current)[1]
@@ -282,6 +295,9 @@ def _report(run: Path) -> Dict[str, Any]:
         blocking.append(f"the run is in {here}: it can finish only from build or review, once the plan is carried out")
     if not done and running:
         blocking.append(f"a peer turn is not recorded yet ({running})")
+    found = facts.report(run, state, Path(state["workspace"]), files)
+    if not done:
+        blocking += facts.blocking(state, found) + [b for b in [quality.blocker(state)] if b]
     if not done and state.get("pending_command"):
         blocking.append(f"a {state['pending_command']['kind']} has not recorded its result yet")
     check = state["last_check"] or {}
@@ -292,7 +308,7 @@ def _report(run: Path) -> Dict[str, Any]:
     return {
         "run": str(run), "store": state.get("store", store.STORE_WORKSPACE), "status": state["status"],
         "phase": "done" if done else here,
-        "allowed_next": [] if done else phases.allowed_next(state, messages),
+        "allowed_next": [] if done else _allowed_next(state, messages, here),
         "with_replan": [] if done else phases.needs_replan(state, messages),
         "host": state["host"], "peer": state["peer"], "models": models.identities(state),
         "peer_session": state["peer_session"], "peer_turns": state["peer_turns"],
@@ -301,7 +317,8 @@ def _report(run: Path) -> Dict[str, Any]:
         "peer_usage": state.get("peer_usage"), "peer_usage_note": USAGE_NOTE[state["peer"]],
         "max_cost_usd": state.get("max_cost_usd"),
         "accept_cmd": state["accept_cmd"], "accept_waived": state["accept_waived"],
-        "last_check_passed": check.get("passed"),
+        "last_check_passed": check.get("passed"), "acceptance_proven": quality.proven(state),
+        "quality_flags": facts.open_findings(state, found), "quality_checked": found["available"],
         "check_valid_on_current_files": bool(check.get("passed") and check.get("stable", True)
                                              and check.get("fingerprint") == current),
         "review_verdicts": verdicts,
@@ -391,6 +408,8 @@ def build_parser() -> argparse.ArgumentParser:
                            "(`accept --cmd`) before the run can move on")
     init.add_argument("--peer", default="codex", choices=sorted(st.HOST_FOR_PEER))
     init.add_argument("--peer-model", help="override the peer client's own default model")
+    init.add_argument("--accept-unproven", type=_nonempty, metavar="WORDS",
+                      help="the user's decision, in their words, to use --accept without showing it can fail")
     init.add_argument("--host-model", help="the host's own model name, recorded so reports name both models")
     init.add_argument("--peer-effort", help="Codex reasoning effort for this run; its own default if omitted")
     init.add_argument("--peer-user-config", action="store_true",
@@ -450,6 +469,21 @@ def build_parser() -> argparse.ArgumentParser:
     extend.add_argument("--cost", type=float, metavar="DOLLARS", help="dollars to add to the cost cap")
     extend.add_argument("--reason", type=_nonempty, required=True)
     extend.set_defaults(func=cmd_extend)
+
+    justify = sub.add_parser("justify", help="record why a runner quality flag is right as it stands")
+    justify.add_argument("--run", required=True)
+    justify.add_argument("--flag", type=_nonempty, required=True, help="the flag id from `status`")
+    justify.add_argument("--reason", type=_nonempty, required=True)
+    justify.set_defaults(func=quality.cmd_justify)
+
+    probe = sub.add_parser("probe", help="show on a scratch copy that the acceptance command can fail")
+    probe.add_argument("--run", required=True)
+    probe.add_argument("--break", dest="break_cmd", type=_nonempty, metavar="COMMAND",
+                       help="a command that breaks the required behaviour in the scratch copy")
+    probe.add_argument("--by-user", type=_nonempty, metavar="WORDS",
+                       help="the user's decision, in their words, to go without proof")
+    probe.add_argument("--timeout", type=_positive_seconds, default=quality.PROBE_TIMEOUT_SECONDS)
+    probe.set_defaults(func=quality.cmd_probe)
 
     reseal = sub.add_parser("reseal", help="accept a run's record after exit 9 (the user's call)")
     reseal.add_argument("--run", required=True)

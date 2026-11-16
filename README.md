@@ -125,8 +125,25 @@ error handling and its tests explicit tasks, and the reviewer is told to try to 
 and to refuse anything that only works on the happy path. The full text is `STANDARD` in
 `scripts/duetlib/prompts.py` and the matching section of `SKILL.md`.
 
-This is an instruction to both models, backed by the review gate (the other model must approve
-the final files); the runner does not itself measure code quality.
+Most of this is an instruction to both models, backed by the review gate (the other model must
+approve the final files). Two parts are checked by the runner itself:
+
+- **Quality flags.** At `init` the runner records, per file, counts of unfinished-work markers
+  (TODO, FIXME, not implemented), functions with no body, errors caught and silently dropped,
+  tests, assertions, skipped tests and credential-shaped strings. It recomputes them for changed
+  files and raises a flag wherever a count got worse, or a test or test file disappeared. Flags
+  appear under `quality_flags` in `status`, are shown to the peer on every review turn, and block
+  `finish` until the code is fixed or the flag is justified on the record with `justify`, which in
+  turn requires fresh reviews. Python is parsed; other languages use patterns, so expect some
+  false alarms there. These are heuristics: an absence of flags does not show the code is good.
+- **Acceptance that can fail.** The run cannot leave `frame`, or finish, until the acceptance
+  command has been seen to fail: by a failing `check` while the goal is unmet, or by `probe
+  --break "<command>"`, which breaks a scratch copy of the workspace and requires the command to
+  fail there. The user can waive this in their own words (`probe --by-user`, or
+  `--accept-unproven` at `init`). An acceptance command that uses absolute paths into the real
+  workspace cannot be probed this way.
+
+Runs started before version 1.10 carry neither check.
 
 ### Stop conditions
 
@@ -264,6 +281,8 @@ $D say  --run <run> --phase plan --file <run>/drafts/reply.md --verdict revise
 $D peer --run <run> --phase plan               # compare evidence, combine compatible parts, assign tasks
 $D say  --run <run> --phase plan --file <run>/drafts/agreed.md --verdict approve   # build needs both to approve
 $D experiment --run <run> --cmd "python3 probe.py"   # settle a dispute by evidence
+$D probe --run <run> --break "rm src/feature.py"    # show acceptance fails when behaviour is broken
+$D justify --run <run> --flag "empty:src/hooks.py" --reason "an extension point"  # answer a quality flag
 $D say  --run <run> --phase build --file <run>/drafts/task.md   # name the one task
 $D peer --run <run> --phase build --write      # peer drives that task
 $D check  --run <run>                          # run the acceptance command

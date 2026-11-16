@@ -1,0 +1,20 @@
+{
+  "description": "Turns a raw configuration mapping into checked options for an outbound HTTP client: base URL, timeout, redirect limit, TLS certificate verification and user agent. Any option left out of the mapping takes a safe default.",
+  "key": {
+    "class": "unsafe-default",
+    "lines": [
+      [
+        55,
+        55
+      ]
+    ],
+    "statement": "verify_tls defaults to False, so a configuration that does not mention it silently turns TLS certificate verification off.",
+    "keywords": [
+      "certificate",
+      "verif",
+      "insecure",
+      "tls",
+      "man[- ]in[- ]the[- ]middle|mitm"
+    ]
+  }
+}

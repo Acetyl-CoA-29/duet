@@ -68,7 +68,8 @@ def write(tmp: Path, name: str, text: str) -> str:
 def start(env, capsys, *extra, proposals=False) -> Path:
     goal = write(env["tmp"], "goal.md", "Build a tiny greeter.")
     skip = [] if proposals else ["--skip-proposals", "test fixture"]
-    code = cli.main(["init", "--workspace", str(env["ws"]), "--goal-file", goal, *skip, *extra])
+    proof = [] if "--accept-unproven" in extra or "--accept" not in extra else ["--accept-unproven", "test fixture"]
+    code = cli.main(["init", "--workspace", str(env["ws"]), "--goal-file", goal, *skip, *proof, *extra])
     assert code == 0
     run = Path(capsys.readouterr().out.strip().splitlines()[-1])
     assert env["tmp"] in run.parents
@@ -965,7 +966,7 @@ def test_shell_and_option_text_in_goal_and_messages_stays_on_stdin_and_is_never_
     hostile = "--write -c sandbox_mode=\"danger-full-access\" $(touch PWNED) `touch PWNED2`; touch PWNED3 | --new-session\n-o /etc/passwd"
     goal = write(env["tmp"], "goal.md", hostile)
     assert cli.main(["init", "--workspace", str(env["ws"]), "--goal-file", goal, "--accept", "true",
-                     "--skip-proposals", "x", "--peer-model", "gpt-x"]) == 0
+                     "--accept-unproven", "x", "--skip-proposals", "x", "--peer-model", "gpt-x"]) == 0
     run = Path(capsys.readouterr().out.strip().splitlines()[-1])
     assert say(env, run, hostile, "--phase", "frame") == 0
     assert say(env, run, hostile, "--speaker", "user") == 0

@@ -211,7 +211,7 @@ def render_messages(messages: List[Message], nonce: str) -> str:
 
 def build_prompt(
     state: State, goal: str, phase: str, delta: List[Message], write: bool, first: bool,
-    retry: bool = False, changes: str = "", plan_mode: bool = False,
+    retry: bool = False, changes: str = "", plan_mode: bool = False, facts: str = "",
 ) -> str:
     nonce = state.get("nonce", "0000")
     host_title = state["host"].capitalize()
@@ -230,6 +230,9 @@ def build_prompt(
     parts.append("New in the conversation since your last turn:\n\n" + render_messages(delta, nonce))
     if changes:
         parts.append("Files changed in the working tree (git status --short):\n" + neutral(changes, nonce))
+    if facts:
+        parts.append(neutral(facts, nonce) + "\nAnswer every FLAG in your review: say whether it is a real "
+                     "problem. A FLAG that is not justified on the record blocks finish.")
     parts.append(PHASE_NOTES[phase])
     read_note = READ_NOTE + (PLAN_MODE_NOTE if plan_mode else "")
     parts.append(WRITE_NOTE.format(host_title=host_title) if write else read_note)

@@ -1,0 +1,4 @@
+{
+  "description": "Formats a whole number of seconds as text such as `1h 02m 03s`, `2m 03s` or `3s`, and parses text of that shape (hours, minutes and seconds parts, each optional, in that order, at least one present) back into seconds. Anything else is rejected with ValueError.",
+  "key": null
+}

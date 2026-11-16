@@ -1,0 +1,20 @@
+{
+  "description": "Pushes locally changed records to a remote service and returns which ones are now synced. One record failing must not stop the rest. The returned `synced` set is what the next run skips, so it must hold exactly the records the remote has accepted, so that failed records are tried again.",
+  "key": {
+    "class": "partial-failure",
+    "lines": [
+      [
+        41,
+        41
+      ]
+    ],
+    "statement": "sync adds every attempted record to the synced set, including the ones whose push failed, so failed records are never retried.",
+    "keywords": [
+      "(mark|record|treat|count|includ|add)(s|ed|ing)?.{0,60}(as )?synced",
+      "(never|not|won't|will not|no longer) (be )?(retried|re-?tried|pushed again|re-?sent|attempted again)",
+      "regardless|even (if|when|though)|whether or not",
+      "failed (record|id|push|one)",
+      "including (the )?(failed|failures)"
+    ]
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "description": "A tally of named whole-number counters shared by several threads. Every operation, including `update`, which replaces a counter with a function of its current value, must behave as one atomic step so that concurrent updates are never lost.",
+  "key": {
+    "class": "race-non-atomic-update",
+    "lines": [
+      [
+        18,
+        23
+      ]
+    ],
+    "statement": "update reads the current value and computes the new one outside the lock, so two threads can read the same value and one update is lost.",
+    "keywords": [
+      "race",
+      "atomic",
+      "outside (of )?the lock|without (holding |taking |acquiring )?the lock|before (acquiring|taking|holding)",
+      "lost update|lose (an )?update|updates? (is|are|can be|gets?|get) lost",
+      "read[- ]modify[- ]write"
+    ]
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "description": "Validates sign-up form fields before an account is created. A username is 3 to 20 characters: a lower-case letter followed only by lower-case letters, digits and underscores, and not a reserved name. The email must look like an address and the password must be long enough and not contain the username. All problems are reported together.",
+  "key": {
+    "class": "missing-input-validation",
+    "lines": [
+      [
+        5,
+        5
+      ],
+      [
+        21,
+        21
+      ]
+    ],
+    "statement": "check_username uses an unanchored match, so any string that merely starts with a valid username (trailing markup, spaces, or over-long names) is accepted.",
+    "keywords": [
+      "anchor",
+      "fullmatch",
+      "prefix|beginning of|start of",
+      "trailing|after the (valid|matched)|rest of the string",
+      "\\$|\\\\z"
+    ]
+  }
+}

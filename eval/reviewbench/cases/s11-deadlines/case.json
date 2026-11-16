@@ -1,0 +1,20 @@
+{
+  "description": "Handles deadlines for submitted jobs. Every time is kept internally as a naive datetime in UTC. Deadlines arrive as ISO 8601 text, with or without a UTC offset (text without an offset is already UTC), and are converted to that internal form before being checked or compared.",
+  "key": {
+    "class": "timezone-confusion",
+    "lines": [
+      [
+        23,
+        23
+      ]
+    ],
+    "statement": "parse_deadline drops the UTC offset without converting, so a timestamp with an offset is treated as if its local wall-clock time were UTC.",
+    "keywords": [
+      "offset",
+      "time ?zone",
+      "tzinfo",
+      "astimezone",
+      "(without|not|never|no) conver"
+    ]
+  }
+}

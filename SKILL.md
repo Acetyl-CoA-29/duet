@@ -1,7 +1,7 @@
 ---
 name: duet
 description: "Two top models, one conversation, one build: you (the host model) and a peer model from the other lab (Codex for a Claude host, Claude for a Codex host) frame a goal, write blind independent proposals, agree on a joint plan, then build, test and iterate together until an agreed acceptance command passes and the non-author approves. Use when asked to run a duet, to have Claude and Codex or GPT work or build together, to pair or debate with the other model, or for a two-model build loop. Not for a one-shot second opinion."
-version: 1.9.0
+version: 1.10.0
 ---
 
 # Duet
@@ -54,6 +54,12 @@ edits to it are only detected (exit 9), not prevented. Tell the user; the warnin
   `--waive "<reason>"`). Never start with a placeholder command: the peer is shown it as real.
 - After the frame phase the command is locked: changing it needs the user's agreement, passed as
   `--by-user "<their words>"`. Never weaken it to get a pass; any change requires fresh reviews.
+- **The run cannot leave `frame` until the acceptance command has been seen to fail**, because a
+  pass from a command that cannot fail proves nothing. A failing baseline `check` is the proof. If
+  the baseline is green (a refactor), run `D probe --run <run> --break "<command that breaks the
+  required behaviour>"`: it breaks a scratch copy, never the workspace, and the command must then
+  fail there. Only on the user's decision, record `D probe --run <run> --by-user "<their words>"`
+  (or `--accept-unproven "<their words>"` at `init`). A replaced command owes proof again.
 - During `frame`, once an acceptance command is set, run the baseline with `D check --run <run>`
   before the command locks. If waived, agree on evidence of success instead. Map requirements to
   observable checks; identify a plausible wrong implementation the command
@@ -165,6 +171,15 @@ safe, and make error handling and its tests planned tasks; in `review`, try to b
 work and give `revise` for any stub, swallowed error, masked defect, test that cannot fail, or
 needless complexity. An explicitly requested draft or prototype narrows scope, never hides defects:
 record its limits in the goal and report; honesty and correctness within that scope still apply.
+
+**The runner checks part of this itself.** It compares the files with the start of the run and
+raises a flag for each file with new unfinished-work markers (TODO, FIXME, not implemented),
+functions with no body, errors caught and silently dropped, removed tests, fewer assertions,
+skipped tests, or credential-shaped strings. Flags are listed under `quality_flags` in `status`,
+shown to the peer on every review turn, and block `finish`. Fix the code; or, when the flagged
+code is right as it stands, record why with `D justify --run <run> --flag "<id>" --reason "<why>"`,
+after which both of you must review again. Never justify to get past the gate. The flags are
+heuristics: no flags does not mean the code is good.
 
 ## How to argue well
 

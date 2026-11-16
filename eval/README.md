@@ -328,3 +328,185 @@ python3 -m pytest tests/test_eval.py -q
 ```
 
 Stand-in clients only (`tests/fake_eval_cli.py`); no model is called.
+
+## Review micro-benchmark
+
+A cheap test, separate from everything above, of the narrowest version of the two-model premise:
+**does a fresh reviewer from the other lab catch more seeded defects than (a) the same model
+reviewing in the session that already took the code in, or (b) a fresh session of the same
+model?** If cross-lab review catches no more, and nothing different, than fresh same-lab review,
+the premise is in trouble before a full comparison is paid for.
+
+It lives in `eval/reviewbench/` and runs from `eval/run_reviewbench.py`. Nothing in it builds
+software; reviewers only read one module and answer.
+
+### What is run
+
+22 small original Python modules (41 to 61 lines) in `eval/reviewbench/cases/`:
+
+- **18 seeded cases**, each with exactly one planted defect that its happy-path tests do not
+  notice: swallowed exception, off-by-one (two), missing input validation (two), non-atomic
+  update, resource leak, unsafe default, path-check bypass, authorization bypass (two),
+  degenerate input, unbounded read of huge input, timezone confusion, unit confusion, retry
+  without bound, mutation of a shared default, partial failure.
+- **4 clean controls** with no planted defect, to measure false alarms.
+
+Each case holds `module.py` (what the reviewer sees), `case.json` (a plain description of what
+the module is meant to do, and the hidden answer key: defect class, line range(s), one-sentence
+statement, 2 to 5 keyword patterns), `test_hidden.py` and, for seeded cases, `fixed.py`.
+`verify` proves without any model that, for every seeded case, the `test_happy_*` tests pass
+and the `test_defect_*` tests fail on the module as shown, everything passes on `fixed.py`, and
+the lines that differ between the two are the lines the key names; and that every control
+passes its tests.
+
+Two kinds of review are run for each case and each model (Claude, Codex):
+
+| Cell | Calls | What happens |
+|---|---|---|
+| `self` | 2 | one session is shown the module and asked to describe it; the same session is then sent the review prompt |
+| `fresh` | 1 | a new session is sent the review prompt |
+
+The three conditions are views of those cells from the side of an "author" model X:
+`self` = X's `self` cell, `fresh-same` = X's `fresh` cell, `fresh-cross` = the other model's
+`fresh` cell. A fresh Codex review is therefore both Claude's `fresh-cross` and Codex's
+`fresh-same`; it is one event and is paid for once.
+
+The review prompt is byte-for-byte the same in every condition. It contains the description and
+the line-numbered module, never the case's name, and says the module may have no defects. It
+asks for `DEFECTS: NONE` or a numbered list of at most five items, each starting with its line
+number(s) and one sentence.
+
+### Scoring (by code, never by a model)
+
+- **Strict catch:** one reported item both cites a line within 2 lines of a keyed range and
+  matches one of the key's keyword patterns. A cited range longer than 20 lines points at
+  nothing in particular and never counts as a line match. Only the first five items are scored.
+- **Lenient catch:** some reported item does either. Both are always shown; when they give
+  different verdicts the result depends on the scoring and is reported as inconclusive.
+- **False alarm:** anything reported on a control.
+- A reply with neither `DEFECTS: NONE` nor a list item is `unparsed`: it counts as a miss, is
+  never a false alarm, and is counted in its own column.
+
+Replies are stored and scored again at every `summary`, so changing a keyword or the tolerance
+costs no calls.
+
+### Decision rule (fixed before any run)
+
+Comparing `fresh-cross` with `fresh-same` head to head only asks which model reviews better,
+and gives the opposite answer for the other author. The rule therefore asks what a second look
+adds to the author's own review. For each author X, over the seeded cases with all three
+conditions present:
+
+    net(X) = (defects missed by X's self review and caught by fresh-cross)
+           - (defects missed by X's self review and caught by fresh-same)
+
+| Result (strict scoring, both authors) | Reading |
+|---|---|
+| net ≥ +3 for both authors | **Supports** the premise, suggestively: worth paying for the fuller comparison. Not proof. |
+| net ≤ 0 for both authors | **Against**: on this test a fresh session of the same model does as well as the other lab. |
+| ≥ +3 for one author and ≤ −3 for the other | **One-sided**: one model is simply the better reviewer here. An argument for using that model, not for pairing labs. |
+| anything else | **Inconclusive**. |
+
+The same rule is applied to the lenient score; if the two disagree the verdict is inconclusive.
+Fewer than 12 complete seeded cases for either author means no verdict at all.
+
+With 18 cases only large differences mean anything. A 3-to-0 split has a two-sided sign-test
+p of 0.25; it takes 6-to-0 to get under 0.05. So "supports" here means "not contradicted, and
+big enough to justify the larger experiment", never "shown". The report prints the sign test
+beside each net, lists the cases caught only by cross-lab and only by same-lab fresh review,
+and, when run with `--samples 2`, how often the very same condition disagreed with itself,
+which is the noise any difference has to clear.
+
+### What it does not measure
+
+- **It is not the pair-versus-solo comparison.** No software is built and no conversation takes
+  place. A positive result says a second lab's reviewer sees different defects in small
+  modules, not that a duet builds better software.
+- **Self-review is approximated.** Paying a model to write each module would cost more and
+  would not put the same defect in front of every reviewer, so the `self` session only reads
+  and describes the module before reviewing it. Real authors have more invested in their own
+  code than that; the approximation probably understates the blind spot it is meant to imitate.
+- **Keyword scoring is crude.** A reviewer who describes the defect correctly in words no
+  pattern anticipates is scored a miss under strict scoring; a vague remark that happens to use
+  a keyword on the right line is scored a catch. The patterns were written by guessing how a
+  reviewer would phrase things and have not been checked against real replies. Read the stored
+  replies for the cases that decide the result before trusting a verdict.
+- **The cases were written by a Claude model.** Planted defects are the ones one lab's model
+  thought of, in that model's style; this may make them easier or harder for Claude than for
+  Codex, in a direction nobody has measured.
+- **Seeded defects are not natural defects.** One defect per small tidy module, of a textbook
+  kind, is easier to spot than a mistake buried in real work. Both models may catch nearly all
+  of them, leaving no room for a difference; a pilot will show whether that ceiling is hit.
+- **Extra findings on seeded cases are not judged.** A reviewer may report a real problem
+  nobody planted, or noise; neither is scored. Only the four controls measure false alarms, and
+  a model can also be "wrong" about a control only in the sense that nothing was planted there.
+- **One sample per cell by default.** Model output varies from run to run.
+
+### Safety and cost
+
+- Reviewers get the module in the prompt and nothing else. Each call runs in a new empty folder
+  under the temp folder. Claude is started with `--tools ""`, `--safe-mode`, a rule denying it
+  the cases and the results, and `--max-budget-usd` per call. Codex is started in its
+  `read-only` sandbox; it keeps a shell that can read the disk by absolute path and runs with
+  your normal Codex configuration, so every call's output is searched for the names of the
+  hidden files and the cases folder, and for shell commands, and `summary` warns if any appear.
+  That search only sees what was printed.
+- Hard caps, counted over every call the session has ever made: `--max-calls` (default: the
+  size of the full plan) and `--max-total-cost` (default $20, Claude's reported dollars). A
+  cell starts only if all of its calls fit under both, a Claude call being counted at the
+  per-call cap (`--max-call-cost`, default $0.50). Codex reports no dollars, so it is bounded
+  by the call cap and the per-call `--timeout` only. A run that meets a cap stops cleanly,
+  records the cells left undone, and exits 1.
+- Resumable: rerun the same command with the same `--session`. Finished cells are never
+  repeated; a `self` cell whose first call succeeded resumes at its second. Cells that ended in
+  an error are left alone unless `--retry-errors` is given. A failed call still counts toward
+  the caps, since it may have been charged.
+- Credentials are never written: the environment is not logged, and each client is started
+  without the other lab's API key. Prompts hold only the module and its description.
+
+**Calls and cost.** A full run is 22 cases × 2 models × 3 calls = **132 calls** (66 Claude,
+66 Codex); `--dry-run` prints the exact number for any selection and session state. No live run
+has been made, so there is no measured cost. Each call is one short prompt of roughly 1,000 to
+1,500 tokens and a short reply, so a full run is expected to land within the $10 to $20 target,
+but a client's fixed per-session overhead and the model and effort chosen decide that. Run the
+two-case pilot below first and multiply.
+
+### Commands
+
+```sh
+cd ~/.agents/skills/duet
+
+python3 eval/run_reviewbench.py list                       # the cases
+python3 eval/run_reviewbench.py verify                     # prove every case; no model calls
+
+# exactly what would run, and how many calls; starts nothing
+python3 eval/run_reviewbench.py run --cases all --dry-run
+python3 eval/run_reviewbench.py run --cases all --dry-run --show-prompt
+
+# pilot: one seeded case and one control, 12 calls, to measure cost per call
+python3 eval/run_reviewbench.py run --cases s07-static-path,k02-intervals --session pilot --max-total-cost 3
+
+# the full run: 132 calls, stops at $20 of reported Claude spend
+python3 eval/run_reviewbench.py run --cases all --session full --max-total-cost 20
+
+# continue a run that stopped at a cap or was interrupted (same command, same session)
+python3 eval/run_reviewbench.py run --cases all --session full --max-total-cost 20
+
+python3 eval/run_reviewbench.py summary                    # every session under ~/.duet-eval/reviewbench
+python3 eval/run_reviewbench.py summary --results ~/.duet-eval/reviewbench/full
+```
+
+Other options: `--claude-model`, `--codex-model` and `--effort` (recorded; a session cannot be
+resumed with different ones), `--samples N`, `--max-calls N`, `--max-call-cost D`,
+`--timeout S`, `--order-seed N`, `--results DIR` (refused inside a git repository), `--work-dir DIR`.
+
+Results go to `~/.duet-eval/reviewbench/<session>/`: `session.json` (each invocation, its
+settings, why it stopped, what was left undone), `ledger.jsonl` (one line per call), `cells/`
+(one record per cell, with the reviewer's reply), and `logs/` (prompt, command and raw output
+of every call).
+
+Tests (stand-in clients only, `tests/fake_review_cli.py`; no model is called):
+
+```sh
+python3 -m pytest tests/test_reviewbench.py -q
+```

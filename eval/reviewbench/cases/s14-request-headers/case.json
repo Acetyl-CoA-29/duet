@@ -1,0 +1,20 @@
+{
+  "description": "Builds the headers for requests to a partner API: fixed defaults, then a bearer token if one is given, then the caller's extra headers after checking them. Each call returns its own dictionary; nothing set for one request may carry over to another.",
+  "key": {
+    "class": "shared-default-mutation",
+    "lines": [
+      [
+        25,
+        25
+      ]
+    ],
+    "statement": "build_headers writes into the module-level DEFAULT_HEADERS dictionary instead of a copy, so one request's token and extra headers leak into every later request.",
+    "keywords": [
+      "mutat|modif",
+      "shared|global|module[- ]level",
+      "cop(y|ies|ied)",
+      "(leak|persist|carr(y|ies|ied)|bleed).{0,60}(request|call)",
+      "alias|same (dict|object)"
+    ]
+  }
+}

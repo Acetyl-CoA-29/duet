@@ -52,7 +52,8 @@ def start(env, capsys, *extra, proposals=False) -> Path:
     """Start a run. Most tests skip the blind round; pass proposals=True to keep it required."""
     goal = write(env["tmp"], "goal.md", "Build a tiny greeter.")
     skip = [] if proposals else ["--skip-proposals", "test fixture"]
-    code = cli.main(["init", "--workspace", str(env["ws"]), "--goal-file", goal, *skip, *extra])
+    proof = [] if "--accept-unproven" in extra or "--accept" not in extra else ["--accept-unproven", "test fixture"]
+    code = cli.main(["init", "--workspace", str(env["ws"]), "--goal-file", goal, *skip, *proof, *extra])
     assert code == 0
     return Path(capsys.readouterr().out.strip().splitlines()[-1])
 
@@ -1838,7 +1839,13 @@ def test_accept_later_keeps_the_run_in_frame_until_the_command_is_set(env, capsy
     assert "Acceptance: not agreed yet" in calls(env)[0]["stdin"] and "`false`" not in calls(env)[0]["stdin"]
     assert cli.main(["check", "--run", str(run)]) == cli.EXIT_USAGE
     assert cli.main(["accept", "--run", str(run), "--cmd", "python3 -m pytest -q"]) == 0
-    assert status(run, capsys)["allowed_next"] == ["frame", "propose"]
+    report = status(run, capsys)
+    assert report["allowed_next"] == ["frame"] and report["acceptance_proven"] is False
+    assert say(env, run, "My approach.", "--phase", "propose") == cli.EXIT_ORDER  # never seen to fail yet
+    assert "never been seen to fail" in capsys.readouterr().err
+    assert cli.main(["check", "--run", str(run)]) == cli.EXIT_CHECK_FAILED  # no tests yet: that is the proof
+    report = status(run, capsys)
+    assert report["allowed_next"] == ["frame", "propose"] and report["acceptance_proven"] is True
     assert say(env, run, "My approach.", "--phase", "propose") == 0
 
 

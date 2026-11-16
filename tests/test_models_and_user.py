@@ -33,7 +33,8 @@ def home(tmp_path, monkeypatch):
 
 def begin(home, capsys, *extra: str) -> Path:
     assert cli.main(["init", "--workspace", str(home["ws"]), "--goal-file", str(home["goal"]),
-                     "--accept", "true", "--skip-proposals", "fixture", *extra]) == cli.EXIT_OK
+                     "--accept", "true", "--accept-unproven", "fixture", "--skip-proposals", "fixture",
+                     *extra]) == cli.EXIT_OK
     return Path(capsys.readouterr().out.strip().splitlines()[-1])
 
 

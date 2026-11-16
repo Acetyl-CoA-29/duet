@@ -1,0 +1,4 @@
+{
+  "description": "Counts words in text for a simple search index. Words are runs of ASCII letters, digits and apostrophes, compared without regard to case; stop words and words shorter than a minimum length are left out. `top_words` returns the most frequent words, most frequent first, ties in alphabetical order.",
+  "key": null
+}

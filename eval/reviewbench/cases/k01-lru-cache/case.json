@@ -1,0 +1,4 @@
+{
+  "description": "A small least-recently-used cache for single-threaded use. Reading or writing a key makes it the most recently used; when a new key would take the cache over its capacity, the least recently used key is dropped. Membership tests and `keys` do not change the order.",
+  "key": null
+}

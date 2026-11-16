@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
-from . import authors, base, gates, models, peers, phases, prompts, snapshot, store
+from . import authors, base, facts, gates, models, peers, phases, prompts, quality, snapshot, store
 from . import state as st
 from .base import (EXIT_BLIND, EXIT_CAP, EXIT_OK, EXIT_ORDER, EXIT_PEER_FAILED, EXIT_READONLY_BROKEN, EXIT_STALLED,
                    EXIT_USAGE, FINISHED_TEXT, emit, warn)
@@ -105,6 +105,8 @@ def order_problem(
         return EXIT_USAGE, '--replan "<reason>" is only for going back to plan from build or review'
     if write and phase != phases.BUILD:
         return EXIT_ORDER, "--write is only for build turns: the peer edits files in `--phase build` alone"
+    if here == phases.FRAME and phase != phases.FRAME and not quality.proven(state):
+        return EXIT_ORDER, "the run cannot leave frame yet: " + quality.UNPROVEN
     problem = phases.refusal(state, messages, phase, replan)
     if problem:
         allowed = ", ".join(phases.allowed_next(state, messages))
@@ -371,11 +373,12 @@ def _prepare(run: Path, args: argparse.Namespace, state: st.State, messages: Lis
     else:
         delta, held = _delta(state, messages, args.phase)
     changes = gates.change_summary(workspace) if args.phase == "review" else ""
+    computed = facts.for_reviewer(state, facts.report(run, state, workspace)) if args.phase == "review" else ""
     plan_mode = state["peer"] == "claude" and peers.claude_uses_plan_mode(args.write)
     prompt = prompts.build_prompt(state, next((m["text"] for m in messages if m["kind"] == "goal"), ""),
                                   args.phase, delta, args.write, session is None,
                                   retry=bool(state.get("last_peer_failed")) and session is not None,
-                                  changes=changes, plan_mode=plan_mode)
+                                  changes=changes, plan_mode=plan_mode, facts=computed)
     attempt = len(list((run / "turns").iterdir())) + 1
     turn_dir = run / "turns" / f"{attempt:03d}"
     turn_dir.mkdir(parents=True, exist_ok=True)
