@@ -392,7 +392,7 @@ def _prepare(run: Path, args: argparse.Namespace, state: st.State, messages: Lis
 
 
 def _verify_record(run: Path) -> None:
-    """An in-workspace record the peer could reach must still match its seal before the turn is written."""
+    """The record must still match its seal before the peer's turn is written."""
     check = getattr(st, "verify_after_turn", None) or st.verify_integrity
     check(run)
 
@@ -419,16 +419,20 @@ def _record(run: Path, args: argparse.Namespace, state: st.State, messages: List
         warn(result.error + note)
         return EXIT_PEER_FAILED
     broke_read_only = bool(violation)
-    superseded = st.load_state(run).get("replan_seq", 0) != pending.get("replan_seq", 0)
+    fresh = st.load_state(run)
+    current_phase = phases.current(fresh, st.read_messages(run))
+    superseded = (fresh.get("replan_seq", 0) != pending.get("replan_seq", 0)
+                  or current_phase not in (phases.current(state, messages), args.phase))
     verdict = gates.parse_verdict(result.reply)
     ignored = verdict if ((args.write or broke_read_only or superseded) and verdict == "approve") else None
     meta = {"verdict": None if ignored else verdict, "verdict_ignored": ignored,
+            "observed_seq": messages[-1]["seq"] if messages else 0,
             "write": args.write or broke_read_only, "fingerprint": after, "usage": result.usage or {}}
     st.append_message(run, state["peer"], args.phase, result.reply, meta=meta, change=lambda fresh, seq: {
         "pending_turn": None, "peer_session": result.session, "peer_replay": False,
         "peer_cursor": messages[-1]["seq"] if messages else 0, "withheld": ready["delta_held"],
         "peer_turns": fresh["peer_turns"] + 1, **_usage_change(fresh, result.session, result.usage),
-        "last_peer_failed": False, "peer_primed": True, "phase": fresh["phase"] if superseded else args.phase,
+        "last_peer_failed": False, "peer_primed": True, "phase": current_phase if superseded else args.phase,
         **_authorship(pending, after, messages, fresh)})
     if args.phase == "propose":
         st.reveal_sealed(run, state["host"])

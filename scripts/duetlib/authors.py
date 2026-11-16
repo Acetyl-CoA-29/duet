@@ -25,15 +25,11 @@ def reviewers_for(state: State, who: List[str]) -> List[str]:
     return [name for name in models(state) if name not in who] if len(who) == 1 else models(state)
 
 
-def _approved(messages: List[Message], speaker: str, fingerprint: str) -> bool:
-    latest, problem = gates.review_standing(messages, speaker, 0)
-    return latest is not None and not problem and latest["meta"].get("fingerprint") == fingerprint
-
-
 def _settled(state: State, messages: List[Message], who: List[str]) -> bool:
     """True when the files the runner last saw carry every approval their writers needed."""
     seen = state.get("seen_fingerprint")
-    return bool(who) and all(_approved(messages, name, seen) for name in reviewers_for(state, who))
+    view = {**state, "last_writer": who[0] if len(who) == 1 else None}
+    return bool(who) and bool(seen) and gates.finish_report(view, messages, seen)[0]
 
 
 def observed(state: State, messages: List[Message], current: str, actor: str, force: bool = False) -> Dict[str, Any]:

@@ -36,9 +36,15 @@ def now_iso() -> str:
 
 def _write_atomic(path: Path, text: str) -> None:
     handle, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
-    with os.fdopen(handle, "w", encoding="utf-8") as fh:
-        fh.write(text)
-    os.replace(tmp, path)
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
 
 
 @contextmanager
@@ -118,17 +124,17 @@ def reconcile(run: Path) -> State:
 
 
 def verify_integrity(run: Path) -> Optional[str]:
-    """Check an in-workspace run against its integrity record before a command acts on it."""
-    if not (run / STATE_FILE).is_file() or not store.is_guarded(run):
+    """Check every run against its integrity record before a command acts on it."""
+    if not (run / STATE_FILE).is_file():
         return None
     with locked(run):
         return store.verify(run)
 
 
 def verify_after_turn(run: Path) -> None:
-    """Check an in-workspace run's record again once the peer's process has exited and before anything
+    """Check the run's record again once the peer's process has exited and before anything
     is written: an edit the peer made during its own turn must not be sealed in by the next write.
-    Raises TamperError; does nothing for runs kept in a state directory."""
+    Raises TamperError for either storage layout."""
     verify_integrity(run)
 
 
@@ -195,8 +201,9 @@ def append_message(
         log = run / MESSAGES_FILE
         so_far = log.read_bytes() if log.is_file() else b""
         store.reseal(run, pending={MESSAGES_FILE: hashlib.sha256(so_far + record).hexdigest()})
-        with log.open("ab") as fh:
-            fh.write(record)
+        # A partial append would leave a torn JSON line and make every later recovery fail.
+        # Publish the complete journal atomically, as we do the state derived from it.
+        _write_atomic(log, (so_far + record).decode("utf-8"))
         with (run / TRANSCRIPT_FILE).open("a", encoding="utf-8") as fh:
             fh.write(_render(message))
         store.reseal(run)

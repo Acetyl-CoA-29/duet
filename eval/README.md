@@ -25,11 +25,11 @@ A run **can** support:
 
 A run **cannot** support:
 
-- "the duet is better" or "worse" from a gap whose intervals overlap. With one seed and five
-  tasks every interval is wide enough to hold any plausible difference.
-- anything about work unlike these tasks. Five small single-file Python tasks, with every trap
-  written into the task text, are easy for current models: in the smoke run every arm passed.
-  A ceiling result says nothing about the duet either way (see "Calibrating tasks").
+- "the duet is better" or "worse" from a gap whose intervals overlap. Small task sets produce
+  wide intervals; report that uncertainty instead of ranking arms from point estimates alone.
+- anything about work unlike these tasks. Every arm passed the historical five-task smoke set
+  of small single-file Python tasks. The current nine-task set adds multi-file repairs whose
+  contracts span code and documentation; the old ceiling result does not measure that set.
 - a like-for-like price. Claude reports dollars and Codex reports tokens, and the two token
   counts are not the same quantity.
 - "same budget". Arms get the same caps, scaled to their structure, not the same spend.
@@ -242,21 +242,27 @@ solutions/naive/      overlay that passes visible, fails hidden (used only by `v
 
 | Task | Kind | The trap |
 |---|---|---|
+| `cursor-feed` | multi-file repair | cursor ordering, compatibility, pagination and export must follow the integration contract |
+| `dependency-planner` | multi-file repair | dependency closure and scheduling must agree between preview and submission |
 | `slugify` | edge cases | accents, apostrophes, truncation that leaves a trailing hyphen, empty results |
 | `duration` | input validation | a find-all regex accepts garbage, wrong order, repeats, decimals, non-ASCII digits |
 | `split-bill` | subtle spec | who gets the leftover cents, ties, refunds, exactness on huge totals |
 | `ttl-cache-bug` | debugging | the failing test points at one seeded defect; the class breaks its contract in several more places |
 | `invoice-refactor` | refactor | a tidy rewrite drops rounding mode, discount fallback, sort order, returns; scored by differential test against the original |
+| `layered-settings` | multi-file rollout | profile resolution, launch planning and operator reporting must preserve compatibility |
+| `record-stream` | multi-file repair | transport chunk boundaries, final records and lifecycle handling must satisfy the wire contract |
 
-Every trap is stated in `task.md`; the visible tests simply do not exercise it.
+Requirements are in `task.md` and, for the multi-file tasks, the supplied repository documentation,
+release notes and compatibility tests. The visible tests do not exercise the whole contract.
 `run_eval.py verify` proves, without any model, that for each task the starter fails, the
 reference passes both suites, and the naive solution passes visible and fails hidden.
 
 ### Calibrating tasks
 
-The shipped tasks are fair and too easy. Each is one file under 80 lines, each trap is spelled
-out, and the brief says the work is judged on the whole description. Expect every arm at or
-near 100%, which cannot separate them.
+The historical five-task smoke set was too easy to separate the arms: each task was a small
+single-file change with its traps spelled out. Four multi-file tasks have since been added.
+Their presence does not establish useful difficulty; calibrate the current nine-task set on
+solo arms before drawing conclusions about whether conversation helps.
 
 A task earns its place when a single model passes its oracle roughly 30 to 70 percent of the
 time. Below that it measures luck; above it there is no room for a second model to help. To
@@ -267,14 +273,15 @@ build such a set:
    task text settles only if read closely. Keep every requirement derivable from what is in the
    workspace; an unstated preference is a guess, not a trap.
 2. Run only the two solo arms on each candidate, three to five seeds, and keep the ones whose
-   pooled solo pass rate falls between 30 and 70 percent. This costs a few cents and about a
-   minute per run.
+   pooled solo pass rate falls between 30 and 70 percent. Measure time and reported cost on
+   those candidates rather than assuming the old smoke runs predict either.
 3. Check each kept task with `verify`, then run the full matrix on the kept set.
 4. Do not tune tasks against duet results. Calibrate on the solo arms only, then freeze the set.
 
 ## Cost
 
-Figures from the one-task smoke run at `--effort low`, so read them as an order of magnitude:
+Historical figures from a one-task smoke run at `--effort low`; these are observations of that
+run, not estimates for the current task set or a future matrix:
 
 | Arm | seconds | reported dollars |
 |---|---|---|
@@ -284,17 +291,11 @@ Figures from the one-task smoke run at `--effort low`, so read them as an order 
 | `duet-codex-host` | about 150 to 250 | about 0.90 to 3.40 (Claude peer only; Codex host unpriced) |
 | `best-of-two-solo` | about 70 | about 0.40 |
 
-One (task, seed) across all five arms is about $4 to $6 in reported dollars and 9 to 11
-minutes. Runs are sequential.
-
-- **The shipped matrix**, 5 tasks × 3 seeds × 5 arms = 75 runs: about $65 to $90 reported and
-  about two and a half hours, plus unpriced Codex tokens. It cannot generalise beyond five
-  tasks and will most likely show every arm at the ceiling.
-- **A sound minimum**: about 30 calibrated tasks × 3 seeds × 5 arms = 450 runs, about $400 to
-  $550 reported and 14 to 16 hours at low effort, plus Codex tokens; more at higher effort or
-  on harder tasks. At roughly 90 runs per arm, a gap of 20 points (say 50% against 70%) is about where
-  the intervals stop overlapping. Smaller gaps need more tasks, not more seeds: tasks are what
-  the result has to generalise over.
+The current full matrix is 9 tasks × 3 repetitions × 5 arms = 135 runs, run sequentially.
+No cost or duration estimate for that matrix follows from the smoke table. Measure a pilot
+with the intended models, effort and current tasks, including unpriced Codex tokens, before
+budgeting a larger comparison. More distinct calibrated tasks improve coverage of real work;
+extra repetitions of the same tasks do not expand that coverage.
 
 `--max-total-cost` counts reported dollars only, checks before each run, and so can be
 overshot by one run and never sees Codex spend.

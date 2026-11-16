@@ -27,7 +27,6 @@ DIR_SUFFIX = "/"  # directories are listed under their name with this suffix
 GIT_TIMEOUT_SECONDS = 60
 STALL_AFTER = 3
 HASH_CHUNK_BYTES = 1 << 16
-HUGE_FILE_BYTES = 100 * 1024 * 1024
 CHANGE_SUMMARY_LINES = 40
 VOLATILE_RE = re.compile(
     r"0x[0-9a-fA-F]+"
@@ -225,8 +224,6 @@ def _entry_digest(path: Path, name: str) -> str:
         return hashlib.sha256(f"special:{stat.S_IFMT(info.st_mode)}".encode("ascii")).hexdigest()
     if name == EXCLUDE_FILE:  # the runner's own `.duet/` line there is not a change
         return hashlib.sha256(_hash_file(path, skip_line=RUN_ROOT.encode("ascii") + b"/")).hexdigest()
-    if info.st_size > HUGE_FILE_BYTES:
-        return hashlib.sha256(mode + f"huge:{info.st_size}:{info.st_mtime_ns}".encode("ascii")).hexdigest()
     return hashlib.sha256(mode + _hash_file(path)).hexdigest()
 
 
@@ -323,6 +320,9 @@ def run_command(command: str, workspace: Path, timeout: int) -> Tuple[Optional[i
             code: Optional[int] = child.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             code = None
+        finally:
+            # Even a successful shell may have left writers in the background. Nothing it
+            # started may outlive the acceptance snapshot or an interrupted runner.
             stop_group(child)
         sink.seek(0)
         output = sink.read().decode("utf-8", "replace")
@@ -408,8 +408,9 @@ def review_standing(messages: List[Message], speaker: str, after_seq: int) -> Tu
                         else f"{speaker} has not given a verdict in the review phase")
     if latest["meta"].get("verdict") != "approve":
         return latest, f"{speaker}'s latest review verdict is not an approval that counts"
-    if latest["seq"] < after_seq:
-        return latest, f"{speaker} approved before the last acceptance run; {speaker} must review again"
+    if min(latest["seq"], latest["meta"].get("observed_seq", latest["seq"])) < after_seq:
+        return latest, (f"{speaker} approved before the last acceptance run or a newer plan/criteria change; "
+                        f"{speaker} must review again after receiving that evidence")
     return latest, ""
 
 
@@ -428,6 +429,12 @@ def current_writer(state: State, current: str) -> Optional[str]:
     if seen is not None and seen != current:
         return state["host"]
     return state.get("last_writer")
+
+
+def review_boundary(state: State, messages: List[Message]) -> int:
+    """Evidence and decisions the reviewers must have received before approving."""
+    check = 0 if state.get("accept_waived") else (state.get("last_check") or {}).get("seq", 0)
+    return max([check] + [m["seq"] for m in messages if m["kind"] in ("accept", "replan", "command_error")])
 
 
 def finish_report(state: State, messages: List[Message], current: Optional[str] = None) -> Tuple[bool, List[str]]:
@@ -451,7 +458,7 @@ def finish_report(state: State, messages: List[Message], current: Optional[str] 
             blocking.append("files changed after the last passing acceptance run; run check again")
     writer = current_writer(state, current)
     reviewers = [s for s in (state["host"], state["peer"]) if s != writer]
-    after_seq = 0 if state.get("accept_waived") else (state.get("last_check") or {}).get("seq", 0)
+    after_seq = review_boundary(state, messages)
     for speaker in reviewers:
         verdict, problem = review_standing(messages, speaker, after_seq)
         if problem:

@@ -1,4 +1,4 @@
-"""Where a run is kept, and the integrity record for runs that have to live inside the workspace."""
+"""Where a run is kept, and the integrity record required for every run."""
 from __future__ import annotations
 
 import hashlib
@@ -60,41 +60,46 @@ def _writable(folder: Path) -> bool:
 def choose(workspace: Path) -> Tuple[Path, str]:
     """The folder new runs go in: outside the workspace when possible, else inside it."""
     home, inside = duet_home().resolve(), workspace.resolve()
-    if home == inside or inside in home.parents:
-        raise DuetError(f"the duet state directory ({home}, from {HOME_ENV}) is inside the workspace: the "
+    root = runs_home().resolve()
+    if home == inside or inside in home.parents or root == inside or inside in root.parents:
+        raise DuetError(f"the duet state directory ({root}, from {HOME_ENV}) is inside the workspace: the "
                         "record would be part of the files being judged and within the peer's reach. Point "
                         f"{HOME_ENV} somewhere outside {inside}, or unset it")
+    custom_guard = os.environ.get(GUARD_ENV)
+    if custom_guard:
+        guard = Path(custom_guard).expanduser().resolve()
+        if any(guard == folder or folder in guard.parents for folder in (inside, home, root)):
+            raise DuetError(f"{GUARD_ENV} ({guard}) must be outside the workspace and the duet state directory")
     if _writable(runs_home()):
         return runs_home(), STORE_HOME
-    return workspace / RUN_ROOT, STORE_WORKSPACE
-
-
-def is_guarded(run: Path) -> bool:
-    """True for a run kept anywhere but a state directory's `runs` folder: the peer can reach its files.
-    Decided from where the run sits, never from the current DUET_HOME (which may differ from the one the
-    run was started under) and never from state.json (which the peer could edit)."""
-    where = run.resolve()
-    return where.parent.name != RUNS_DIR or RUN_ROOT in where.parts
+    fallback = workspace / RUN_ROOT
+    if fallback.is_symlink():
+        raise DuetError(f"the fallback run store ({fallback}) is a symbolic link; use a real .duet directory "
+                        "so its location and isolation cannot change through that link")
+    return fallback, STORE_WORKSPACE
 
 
 def hidden_from_peer(run: Path) -> Path:
     """The folder the peer has no business reading: the whole state directory, or the in-workspace store."""
-    return run.resolve().parent if is_guarded(run) else run.resolve().parent.parent
+    where = run.resolve()
+    in_state_directory = where.parent.name == RUNS_DIR and RUN_ROOT not in where.parts
+    return where.parent.parent if in_state_directory else where.parent
 
 
 def _guard_roots() -> List[Path]:
     """Where integrity records may live, best first: DUET_GUARD_DIR alone when it is set; otherwise a
-    folder beside the state directory (it survives a reboot, and a sandboxed peer cannot write it) and
-    then the temp directory (all a sandboxed host can write outside the workspace)."""
+    folder beside the state directory (it survives a reboot) and then the temp directory. Writability
+    by a peer depends on its inherited permissions; the seal detects edits rather than isolating them."""
     custom = os.environ.get(GUARD_ENV)
     if custom:
-        return [Path(custom)]
+        return [Path(custom).expanduser()]
     return [Path(DEFAULT_GUARD).expanduser(), Path(tempfile.gettempdir()) / f"duet-guard-{os.getuid()}"]
 
 
 def _seal_name(run: Path) -> str:
-    where = hashlib.sha256(str(run.resolve()).encode("utf-8", "replace")).hexdigest()[:12]
-    return f"{run.name}-{where}.json"
+    resolved = run.resolve()
+    where = hashlib.sha256(str(resolved).encode("utf-8", "replace")).hexdigest()[:12]
+    return f"{resolved.name}-{where}.json"
 
 
 def _mtime(path: Path) -> int:
@@ -137,8 +142,6 @@ def reseal(run: Path, pending: Optional[Dict[str, str]] = None) -> None:
 
     `pending` names the digest a file is about to have: the record then accepts either, so a runner
     killed between writing the file and sealing it again does not look like tampering."""
-    if not is_guarded(run):
-        return
     record: Dict[str, object] = dict(_digests(run))
     if pending:
         record[PENDING_KEY] = dict(pending)
@@ -146,7 +149,7 @@ def reseal(run: Path, pending: Optional[Dict[str, str]] = None) -> None:
     candidates = [root / _seal_name(run) for root in _guard_roots()]
     written = next((path for path in candidates if _write_seal(path, text)), None)
     if written is None:
-        raise DuetError("the integrity record for this in-workspace run could not be written to any of: "
+        raise DuetError("the integrity record for this run could not be written to any of: "
                         + ", ".join(str(path.parent) for path in candidates)
                         + f". Set {GUARD_ENV} to a writable folder outside the workspace")
     for stale in candidates:
@@ -155,14 +158,6 @@ def reseal(run: Path, pending: Optional[Dict[str, str]] = None) -> None:
                 stale.unlink()
             except OSError:
                 pass
-
-
-def _created_with_a_seal(run: Path) -> bool:
-    """Runs from before the integrity record existed carry no `store` field."""
-    try:
-        return "store" in json.loads((run / STATE_FILE).read_text(encoding="utf-8"))
-    except (OSError, ValueError, TypeError):
-        return True
 
 
 def changed_since_seal(run: Path) -> Optional[List[str]]:
@@ -183,20 +178,15 @@ def changed_since_seal(run: Path) -> Optional[List[str]]:
 
 
 def verify(run: Path) -> Optional[str]:
-    """Raise TamperError if the record was edited outside the runner. Returns a notice for old runs."""
-    if not is_guarded(run):
-        return None
+    """Raise TamperError if the record changed or its seal is missing, including for legacy runs."""
     changed = changed_since_seal(run)
     fix = (f"Read the record before trusting it. If the user accepts it as it stands: "
            f"`reseal --run {run} --by-user \"<their words>\"`")
     if changed is None:
-        if _created_with_a_seal(run):
-            raise TamperError(f"the integrity record for this run is missing ({seal_path(run)}), so its state "
-                              "and messages cannot be trusted. It is kept outside the workspace and can be lost "
-                              f"to a cleared temp directory or a different {GUARD_ENV}; it can also have been "
-                              f"deleted. {fix}")
-        reseal(run)
-        return "this run predates the integrity record; it is trusted as it stands from now on"
+        raise TamperError(f"the integrity record for this run is missing ({seal_path(run)}), so its state "
+                          "and messages cannot be trusted. Legacy unsealed runs also need explicit resealing. "
+                          "The seal can be lost to a cleared temp directory, a different "
+                          f"{GUARD_ENV}, or deletion. {fix}")
     if changed:
         raise TamperError(f"{' and '.join(changed)} changed outside the runner since its last command, so "
                           f"approvals and check results in this run cannot be trusted. {fix}")

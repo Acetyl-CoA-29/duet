@@ -866,7 +866,7 @@ def test_sealed_proposal_stays_encoded_in_both_store_locations(fallback, capsys)
     assert "HOST-SEALED-IDEA" not in on_disk
 
 
-def test_run_from_the_previous_layout_still_loads(env, capsys):
+def test_run_from_the_previous_layout_needs_explicit_reseal_then_loads(env, capsys):
     run = env["ws"] / ".duet" / "20250101-000000-abcd"
     for name in ("turns", "drafts", "checks"):
         (run / name).mkdir(parents=True)
@@ -878,9 +878,14 @@ def test_run_from_the_previous_layout_still_loads(env, capsys):
     (run / "messages.jsonl").write_text(json.dumps(
         {"seq": 1, "ts": "t", "speaker": "user", "phase": "frame", "kind": "goal", "text": "Old goal", "meta": {}}) + "\n")
     (run / "conversation.md").write_text("# old\n")
+    assert cli.main(["status", "--run", str(run)]) == cli.EXIT_TAMPERED
+    assert "Legacy unsealed runs" in capsys.readouterr().err
+    assert not store.seal_path(run).exists()
+    assert cli.main(["reseal", "--run", str(run), "--by-user", "I inspected this legacy run"]) == 0
+    capsys.readouterr()
     assert cli.main(["status", "--run", str(run)]) == 0
     captured = capsys.readouterr()
-    assert json.loads(captured.out)["store"] == "workspace" and "predates the integrity record" in captured.err
+    assert json.loads(captured.out)["store"] == "workspace" and not captured.err
     assert say(env, run, "carry on", "--phase", "frame") == 0
     assert cli.main(["peer", "--run", str(run), "--phase", "frame"]) == 0
     assert cli.main(["check", "--run", str(run)]) == 0
@@ -944,10 +949,13 @@ def test_integrity_record_is_kept_outside_the_workspace_and_follows_normal_use(f
     assert cli.main(["status", "--run", str(run)]) == cli.EXIT_TAMPERED
 
 
-def test_runs_in_the_state_directory_need_no_integrity_record(env, capsys):
+def test_runs_in_the_state_directory_also_require_integrity_record(env, capsys):
     run = start(env, capsys, "--accept", "true")
-    assert not store.seal_path(run).exists() and not store.is_guarded(run)
+    assert store.seal_path(run).is_file()
     assert cli.main(["status", "--run", str(run)]) == 0
+    store.seal_path(run).unlink()
+    assert cli.main(["status", "--run", str(run)]) == cli.EXIT_TAMPERED
+    assert not store.seal_path(run).exists()
 
 
 # --- read-only turns are undone ------------------------------------------------------------------
@@ -1344,6 +1352,8 @@ def _legacy_run(env, labels):
                      "text": f"{speaker} in {phase}", "meta": {}})
     (run / "messages.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
     (run / "conversation.md").write_text("# old\n")
+    assert cli.main(["status", "--run", str(run)]) == cli.EXIT_TAMPERED
+    assert cli.main(["reseal", "--run", str(run), "--by-user", "I inspected this legacy run"]) == 0
     return run
 
 
@@ -1604,9 +1614,14 @@ def test_changed_file_that_can_be_neither_copied_nor_moved_is_left_in_place(env,
     run = start(env, capsys, "--accept", "true")
     enter_build(env, run)
     monkeypatch.setattr(snapshot, "save_evidence", lambda *a, **k: [])
-    monkeypatch.setattr(os, "replace", lambda *a, **k: (_ for _ in ()).throw(OSError("cross-device")))
-    monkeypatch.setattr(st, "update_state", None, raising=False)  # the stand-in above would break its rename
-    monkeypatch.setattr(st, "_write_atomic", lambda path, text: Path(path).write_text(text))
+    replace = os.replace
+
+    def refuse_evidence_move(source, target):
+        if Path(source) == env["ws"] / "app.py":
+            raise OSError("cross-device")
+        return replace(source, target)
+
+    monkeypatch.setattr(os, "replace", refuse_evidence_move)
     monkeypatch.setenv("FAKE_WRITE_FILE", str(env["ws"] / "app.py"))
     assert cli.main(["peer", "--run", str(run), "--phase", "review"]) == cli.EXIT_READONLY_BROKEN
     assert (env["ws"] / "app.py").read_text() == "print('hi')\nedit\n"
@@ -1710,6 +1725,7 @@ def test_writers_start_again_from_a_fully_approved_state(env, capsys, monkeypatc
     monkeypatch.setenv("FAKE_WRITE_FILE", str(env["ws"] / "feature.py"))
     assert cli.main(["peer", "--run", str(run), "--phase", "build", "--write"]) == 0
     monkeypatch.delenv("FAKE_WRITE_FILE")
+    assert cli.main(["check", "--run", str(run)]) == 0
     assert say(env, run, "Read it.", "--phase", "review", "--verdict", "approve") == 0  # the peer's work is approved
     (env["ws"] / "app.py").write_text("print('later host edit')\n")
     assert status(run, capsys)["writers"] == ["claude"]  # seen at once, even before any command records it
@@ -2260,7 +2276,7 @@ def test_check_by_products_become_the_files_last_seen(env, capsys):
     assert cli.main(["check", "--run", str(run)]) == 0
     state = st.load_state(run)
     assert state["last_check"]["stable"] is False and state["seen_fingerprint"] == gates.fingerprint(env["ws"])
-    assert state.get("writers", []) == []
+    assert state["writers"] == [state["host"]]  # unignored output is source; it needs independent review
 
 
 def test_only_the_real_codex_client_counts_as_enforcing_read_only(monkeypatch):

@@ -6,7 +6,7 @@ import json
 import sys
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator
+from typing import Any, Callable, ContextManager, Dict, Iterator
 
 from . import state as st
 from . import store
@@ -26,6 +26,7 @@ EXIT_INTERNAL = 70
 
 FINISHED_TEXT = "this run is finished; start a new one"
 PEER_LOCK_FILE = ".peer.lock"
+COMMAND_LOCK_FILE = ".command.lock"
 BUSY_TEXT = ("a peer turn is already running for this run. Wait for it to finish, or stop that `peer` "
              "command, before starting another: two turns cannot share one session")
 
@@ -69,9 +70,9 @@ def update(run: Path, change: Change) -> st.State:
 
 
 @contextmanager
-def peer_lock(run: Path) -> Iterator[bool]:
-    """Try to take the run's peer-turn lock without waiting. Yields False when a turn already holds it."""
-    with (run / PEER_LOCK_FILE).open("a") as fh:
+def _operation_lock(run: Path, filename: str) -> Iterator[bool]:
+    """Try one operation lock without holding the state lock during a long command."""
+    with (run / filename).open("a") as fh:
         try:
             fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -81,3 +82,13 @@ def peer_lock(run: Path) -> Iterator[bool]:
             yield True
         finally:
             fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def peer_lock(run: Path) -> ContextManager[bool]:
+    """Yields False when another peer turn already holds the run."""
+    return _operation_lock(run, PEER_LOCK_FILE)
+
+
+def command_lock(run: Path) -> ContextManager[bool]:
+    """Serialize checks and experiments, including their output receipts."""
+    return _operation_lock(run, COMMAND_LOCK_FILE)

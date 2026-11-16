@@ -16,8 +16,11 @@ follow, failures that can be seen and diagnosed, safe defaults, no secrets in co
 users, data and interfaces kept working or migrated deliberately.
 - Hold the bar of a production code review at that company. If you would not sign off on it there, \
 it is not done.
-- Take the route that gives the strongest result, not the quickest one. Turns and effort are not \
-the scarce thing here; a result that holds under pressure is. Never trade robustness for finishing sooner.
+- Take the route that gives the strongest result, not the quickest one. Respect the user's scope \
+and hard turn, cost and time caps; if they prevent completion, stop incomplete and name the gaps. \
+Never trade robustness for finishing sooner or claim unfinished work is done.
+- An explicitly requested draft or prototype narrows the deliverable, not honesty or correctness \
+within that scope. Record its limits in the goal and report; never hide defects behind that label.
 - Finish what you start. No stubs, placeholders, TODOs standing in for behaviour, hard-coded \
 answers, code shaped to the tests instead of the requirement, or commented-out leftovers. If \
 something cannot be done in this run, name it as a gap; never hide it.
@@ -38,7 +41,10 @@ STANDARD_REMINDER = (
     "The engineering standard still applies: own the outcome as a CTO and head of engineering would, "
     "build what you would sign off on in a production review, the strongest route rather than the quickest, nothing left "
     "as a stub or placeholder, failure paths handled as carefully as the happy path, causes fixed rather "
-    "than masked, tests that can fail, and no complexity the goal does not need."
+    "than masked, tests that can fail, and no complexity the goal does not need. Use safe defaults, "
+    "keep secrets out of code, validate at boundaries, make failures diagnosable, and preserve compatibility "
+    "or migrate deliberately. Respect scope and hard caps; stop incomplete if necessary. An explicit draft "
+    "or prototype narrows scope, never hides defects. Claim only what you verified."
 )
 
 PREAMBLE = """You are {peer_title} in a two-model working session with {host_title}, a peer AI \
@@ -155,7 +161,8 @@ PHASE_NOTES = {
                "or check file changed since the plan and say whether any assertion was removed or loosened; "
                "explain changed expectations and note when a planned test/implementation split did not happen. "
                "Approve only after inspecting the current files, seeing the acceptance check pass on those "
-               "files (unless explicitly waived), and testing an uncovered case. " + VERDICT_LINE),
+               "files (unless explicitly waived), and testing an uncovered case. The check must be in the "
+               "conversation sent to this turn; a check completed later needs a new review turn. " + VERDICT_LINE),
 }
 
 WRITE_NOTE = (
@@ -167,7 +174,7 @@ WRITE_NOTE = (
 )
 READ_NOTE = ("You have read-only access for this turn. You may run commands that read or test; caches and "
              "git-ignored files they write do not count. Do not edit, create or delete source files: any such "
-             "change is undone and voids your verdict for the turn.")
+             "change is detected and voids your verdict for the turn, and it may not be undone for you.")
 PLAN_MODE_NOTE = (
     " Plan mode is switched on only as that read-only guard: do not write a plan file, do not ask "
     "to leave plan mode and do not mention it; reply with your message for this phase. You may "

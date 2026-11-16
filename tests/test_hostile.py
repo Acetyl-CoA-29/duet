@@ -629,6 +629,8 @@ def test_state_file_from_before_newer_keys_runs_to_a_gated_finish(env, capsys):
                      "text": "old", "meta": {"verdict": "approve"}})
     (run / "messages.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
     (run / "conversation.md").write_text("# old\n")
+    assert cli.main(["status", "--run", str(run)]) == cli.EXIT_TAMPERED
+    assert cli.main(["reseal", "--run", str(run), "--by-user", "I inspected this legacy run"]) == 0
     assert status(run, capsys)["phase"] == "build"
     assert finish(run) == cli.EXIT_NOT_DONE  # old approvals outside review count for nothing
     (env["ws"] / "app.py").write_text("print('new')\n")
@@ -902,9 +904,9 @@ def test_damaged_record_is_reported_plainly_and_never_gates_a_finish(env, capsys
         (run / "state.json").write_text(text[: len(text) // 2] if damage == "state-truncated" else "")
     capsys.readouterr()
     for argv in (["status"], ["finish"], ["check"], ["peer", "--phase", "review"]):
-        assert cli.main([argv[0], "--run", str(run), *argv[1:]]) == cli.EXIT_USAGE
+        assert cli.main([argv[0], "--run", str(run), *argv[1:]]) == cli.EXIT_TAMPERED
     err = capsys.readouterr().err
-    assert "internal error" not in err and ("damaged" in err or "not valid JSON" in err)
+    assert "internal error" not in err and "changed outside the runner" in err
 
 
 def test_peer_is_stopped_when_the_runner_itself_is_terminated(env, capsys):
@@ -1172,14 +1174,14 @@ def test_runner_killed_between_the_write_and_the_seal_is_not_a_tamper_report(fal
 
 def test_a_different_state_directory_on_a_later_command_is_not_a_tamper_report(env, capsys, monkeypatch):
     run = start(env, capsys, "--accept", "true")
+    seal = store.seal_path(run)
     monkeypatch.setenv("DUET_HOME", str(env["tmp"] / "some-other-home"))
-    monkeypatch.delenv("DUET_GUARD_DIR")
-    monkeypatch.setattr(store, "DEFAULT_GUARD", str(env["tmp"] / "unused-guard"))
-    assert not store.is_guarded(run) and store.hidden_from_peer(run) == env["home"].resolve()
+    assert store.hidden_from_peer(run) == env["home"].resolve()
+    assert store.seal_path(run) == seal and seal.is_file()
     assert say(env, run, "hello", "--phase", "frame") == 0
     assert peer(run, "frame") == 0
     assert cli.main(["status", "--run", str(run)]) == 0
-    assert not (env["tmp"] / "unused-guard").exists()
+    assert store.seal_path(run) == seal
 
 
 def test_integrity_record_prefers_a_lasting_folder_and_falls_back_to_temp(fallback, capsys, monkeypatch, tmp_path):
@@ -1190,7 +1192,7 @@ def test_integrity_record_prefers_a_lasting_folder_and_falls_back_to_temp(fallba
     monkeypatch.setattr(store, "DEFAULT_GUARD", str(lasting))
     monkeypatch.setattr(store.tempfile, "tempdir", str(temp))
     run = start(env, capsys, "--accept", "true")
-    assert store.is_guarded(run) and lasting in store.seal_path(run).parents
+    assert store.seal_path(run).is_file() and lasting in store.seal_path(run).parents
     assert say(env, run, "one", "--phase", "frame") == 0
     seal = store.seal_path(run).read_bytes()
     import shutil

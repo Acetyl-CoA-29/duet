@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from . import authors, base, gates, peers, phases, store, turn
+from . import authors, base, gates, operations, peers, phases, store, turn
 from . import state as st
 from .base import (EXIT_BLIND, EXIT_CAP, EXIT_CHECK_FAILED, EXIT_INTERNAL, EXIT_NOT_DONE,  # noqa: F401 - re-exported
                    EXIT_OK, EXIT_ORDER, EXIT_PEER_FAILED, EXIT_READONLY_BROKEN, EXIT_STALLED, EXIT_TAMPERED,
@@ -131,6 +131,13 @@ def _phase_now(run: Path, state: st.State) -> str:
 
 
 def cmd_check(args: argparse.Namespace) -> int:
+    if not st.load_state(Path(args.run)).get("accept_cmd"):
+        raise st.DuetError("no acceptance command is set; use `accept --cmd`")
+    with operations.running(Path(args.run), "check"):
+        return _check(args)
+
+
+def _check(args: argparse.Namespace) -> int:
     run = Path(args.run)
     with base.transaction(run) as state:
         if not state.get("accept_cmd"):
@@ -157,12 +164,13 @@ def cmd_check(args: argparse.Namespace) -> int:
                  "so the command may not actually test the goal.")
     def change(fresh: st.State, seq: int) -> Dict[str, Any]:
         # Authorship was recorded at admission; comparing the old baseline with a later
-        # peer receipt here would falsely attribute that peer's work to the host. The command's own
-        # by-products become the files last seen, unless another command recorded a change meanwhile.
-        seen = {"seen_fingerprint": result["fingerprint"]} if fresh.get("seen_fingerprint") == found else {}
+        # peer receipt here would falsely attribute that peer's work to the host. The command's
+        # source changes belong to the host, unless another command recorded changes meanwhile.
+        seen = (authors.observed(fresh, st.read_messages(run), result["fingerprint"], fresh["host"])
+                if fresh.get("seen_fingerprint") == found else {})
         if fresh.get("accept_cmd") != state["accept_cmd"]:
-            return seen  # the command was replaced while this one ran: its result proves nothing now
-        return {**seen, "fail_streak": gates.next_streak(fresh["fail_streak"], result),
+            return {**seen, "pending_command": None}  # the replaced command proves nothing now
+        return {**seen, "pending_command": None, "fail_streak": gates.next_streak(fresh["fail_streak"], result),
                 "last_check": {"seq": seq, "passed": result["passed"], "stable": result["stable"],
                                "fingerprint": result["fingerprint"]}}
 
@@ -175,6 +183,11 @@ def cmd_check(args: argparse.Namespace) -> int:
 
 def cmd_experiment(args: argparse.Namespace) -> int:
     """Run a command both models agreed would settle a disagreement, and put the output on the record."""
+    with operations.running(Path(args.run), "experiment"):
+        return _experiment(args)
+
+
+def _experiment(args: argparse.Namespace) -> int:
     run = Path(args.run)
     state = st.load_state(run)
     if not args.cmd.strip():
@@ -182,7 +195,13 @@ def cmd_experiment(args: argparse.Namespace) -> int:
     code, output = gates.run_command(args.cmd, Path(state["workspace"]), args.timeout)
     text = f"Experiment `{args.cmd}` exited {code}.\n\n```\n{gates.excerpt(output)}\n```"
     with base.transaction(run) as fresh:
-        st.append_message(run, "system", _phase_now(run, fresh), text, kind="experiment", meta={"exit_code": code})
+        current = gates.fingerprint(Path(fresh["workspace"]))
+        messages = st.read_messages(run)
+        st.append_message(run, "system", _phase_now(run, fresh), text, kind="experiment", meta={"exit_code": code},
+                          change=lambda latest, seq: {
+                              "pending_command": None,
+                              **authors.observed(latest, messages, current, latest["host"]),
+                          })
     emit(text)
     return EXIT_OK if code == 0 else EXIT_CHECK_FAILED
 
@@ -232,7 +251,7 @@ def cmd_extend(args: argparse.Namespace) -> int:
 
 
 def cmd_reseal(args: argparse.Namespace) -> int:
-    """Accept an in-workspace run's record as it stands after the integrity check refused it."""
+    """Accept a run's record as it stands after the integrity check refused it."""
     run = Path(args.run)
     state = st.load_state(run)
     st.reseal(run)
@@ -254,6 +273,8 @@ def _report(run: Path) -> Dict[str, Any]:
         blocking.append(f"the run is in {here}: it can finish only from build or review, once the plan is carried out")
     if not done and running:
         blocking.append(f"a peer turn is not recorded yet ({running})")
+    if not done and state.get("pending_command"):
+        blocking.append(f"a {state['pending_command']['kind']} has not recorded its result yet")
     check = state["last_check"] or {}
     verdicts = {}
     for speaker in authors.models(state):
@@ -267,6 +288,7 @@ def _report(run: Path) -> Dict[str, Any]:
         "host": state["host"], "peer": state["peer"],
         "peer_session": state["peer_session"], "peer_turns": state["peer_turns"],
         "max_turns": state["max_turns"], "messages": len(messages), "peer_turn": running,
+        "pending_command": state.get("pending_command"),
         "peer_usage": state.get("peer_usage"), "peer_usage_note": USAGE_NOTE[state["peer"]],
         "max_cost_usd": state.get("max_cost_usd"),
         "accept_cmd": state["accept_cmd"], "accept_waived": state["accept_waived"],
@@ -330,6 +352,22 @@ def _phase_arg(value: str) -> str:
         raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
+def _nonempty(value: str) -> str:
+    if not value.strip():
+        raise argparse.ArgumentTypeError("must contain non-whitespace text")
+    return value
+
+
+def _positive_seconds(value: str) -> int:
+    try:
+        seconds = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("timeout must be an integer greater than 0") from exc
+    if seconds <= 0:
+        raise argparse.ArgumentTypeError("timeout must be an integer greater than 0")
+    return seconds
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="duet", description="Two models, one conversation, one build.")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -337,8 +375,8 @@ def build_parser() -> argparse.ArgumentParser:
     init = sub.add_parser("init", help="start a run for a workspace")
     init.add_argument("--workspace", required=True)
     init.add_argument("--goal-file", help="file holding the goal; stdin if omitted")
-    init.add_argument("--accept", help="command that must exit 0 for the goal to count as met")
-    init.add_argument("--waive-accept", help="reason there is no runnable acceptance command")
+    init.add_argument("--accept", type=_nonempty, help="command that must exit 0 for the goal to count as met")
+    init.add_argument("--waive-accept", type=_nonempty, help="reason there is no runnable acceptance command")
     init.add_argument("--accept-later", action="store_true",
                       help="the acceptance command is not known yet: the frame phase must set it "
                            "(`accept --cmd`) before the run can move on")
@@ -348,7 +386,7 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--peer-user-config", action="store_true",
                       help="Claude peer only: load your personal Claude setup (hooks, instructions, plugins) "
                            "instead of a clean session")
-    init.add_argument("--skip-proposals", metavar="REASON",
+    init.add_argument("--skip-proposals", type=_nonempty, metavar="REASON",
                       help="allow building and finishing without the blind proposal round (say why)")
     init.add_argument("--max-cost", type=float,
                       help="stop asking the peer once its client has reported this many US dollars "
@@ -373,37 +411,37 @@ def build_parser() -> argparse.ArgumentParser:
     peer.add_argument("--new-session", action="store_true",
                       help="start a fresh peer session and replay the whole conversation into it "
                            "(use when the old session cannot be resumed)")
-    peer.add_argument("--timeout", type=int, default=peers.DEFAULT_TIMEOUT_SECONDS)
+    peer.add_argument("--timeout", type=_positive_seconds, default=peers.DEFAULT_TIMEOUT_SECONDS)
     peer.set_defaults(func=cmd_peer)
 
     check = sub.add_parser("check", help="run the acceptance command and record the result")
     check.add_argument("--run", required=True)
-    check.add_argument("--timeout", type=int, default=gates.CHECK_TIMEOUT_SECONDS)
+    check.add_argument("--timeout", type=_positive_seconds, default=gates.CHECK_TIMEOUT_SECONDS)
     check.set_defaults(func=cmd_check)
 
     accept = sub.add_parser("accept", help="set or replace the acceptance command")
     accept.add_argument("--run", required=True)
-    accept.add_argument("--cmd")
-    accept.add_argument("--waive", metavar="REASON", help="record that no command can prove the goal, and why")
-    accept.add_argument("--by-user", metavar="WORDS", help="the user's agreement, required after the frame phase")
+    accept.add_argument("--cmd", type=_nonempty)
+    accept.add_argument("--waive", type=_nonempty, metavar="REASON", help="record that no command can prove the goal, and why")
+    accept.add_argument("--by-user", type=_nonempty, metavar="WORDS", help="the user's agreement, required after the frame phase")
     accept.set_defaults(func=cmd_accept)
 
     experiment = sub.add_parser("experiment", help="run a command to settle a disagreement and record its output")
     experiment.add_argument("--run", required=True)
-    experiment.add_argument("--cmd", required=True)
-    experiment.add_argument("--timeout", type=int, default=600)
+    experiment.add_argument("--cmd", type=_nonempty, required=True)
+    experiment.add_argument("--timeout", type=_positive_seconds, default=600)
     experiment.set_defaults(func=cmd_experiment)
 
     extend = sub.add_parser("extend", help="raise the turn cap or the cost cap after the user agrees")
     extend.add_argument("--run", required=True)
     extend.add_argument("--turns", type=int, help="peer turns to add to the cap")
     extend.add_argument("--cost", type=float, metavar="DOLLARS", help="dollars to add to the cost cap")
-    extend.add_argument("--reason", required=True)
+    extend.add_argument("--reason", type=_nonempty, required=True)
     extend.set_defaults(func=cmd_extend)
 
-    reseal = sub.add_parser("reseal", help="accept an in-workspace run's record after exit 9 (the user's call)")
+    reseal = sub.add_parser("reseal", help="accept a run's record after exit 9 (the user's call)")
     reseal.add_argument("--run", required=True)
-    reseal.add_argument("--by-user", metavar="WORDS", required=True, help="the user's agreement, in their words")
+    reseal.add_argument("--by-user", type=_nonempty, metavar="WORDS", required=True, help="the user's agreement, in their words")
     reseal.set_defaults(func=cmd_reseal)
 
     for name, func, text in (("status", cmd_status, "show where the run stands"),
@@ -431,6 +469,7 @@ def _before(args: argparse.Namespace) -> Optional[int]:
             return EXIT_USAGE
         return None
     turn.settle_if_abandoned(run)
+    operations.settle_if_abandoned(run)
     return None
 
 
@@ -450,6 +489,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     except st.TamperError as exc:
         warn(str(exc))
         return EXIT_TAMPERED
+    except operations.CommandInterrupted as exc:
+        warn(str(exc))
+        return EXIT_CHECK_FAILED
     except (st.DuetError, OSError) as exc:
         warn(str(exc))
         return EXIT_USAGE

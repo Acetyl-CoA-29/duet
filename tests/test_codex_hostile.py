@@ -536,7 +536,7 @@ def test_sparse_large_file_restores_contents_size_and_nanosecond_mtime(env, caps
     path = env["ws"] / "large.bin"
     with path.open("wb") as handle:
         handle.write(b"original")
-        handle.truncate(gates.HUGE_FILE_BYTES + 1)
+        handle.truncate(100 * 1024 * 1024 + 1)
     os.utime(str(path), ns=(1_600_000_000_123456789, 1_600_000_000_123456789))
     before = path.stat()
     fingerprint = gates.fingerprint(env["ws"])
