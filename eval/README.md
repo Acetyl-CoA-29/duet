@@ -431,9 +431,9 @@ which is the noise any difference has to clear.
   a keyword on the right line is scored a catch. The patterns were written by guessing how a
   reviewer would phrase things and have not been checked against real replies. Read the stored
   replies for the cases that decide the result before trusting a verdict.
-- **The cases were written by a Claude model.** Planted defects are the ones one lab's model
-  thought of, in that model's style; this may make them easier or harder for Claude than for
-  Codex, in a direction nobody has measured.
+- **The cases come from one side of the comparison.** They were drafted with a Claude model,
+  so the planted defects are the ones that model thought of, in its style; this may make them
+  easier or harder for Claude than for Codex, in a direction nobody has measured.
 - **Seeded defects are not natural defects.** One defect per small tidy module, of a textbook
   kind, is easier to spot than a mistake buried in real work. Both models may catch nearly all
   of them, leaving no room for a difference; a pilot will show whether that ceiling is hit.
