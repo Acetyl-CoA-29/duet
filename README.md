@@ -13,13 +13,28 @@ It carries messages, keeps the record, and refuses to let either model skip a st
 ## Install
 
 ```sh
+mkdir -p ~/.agents/skills ~/.claude/skills ~/.codex/skills
 git clone https://github.com/Acetyl-CoA-29/duet ~/.agents/skills/duet
 ln -s ~/.agents/skills/duet ~/.claude/skills/duet
 ln -s ~/.agents/skills/duet ~/.codex/skills/duet
 ```
 
-You need Python 3.9 or later (standard library only) and both the `claude` and `codex` clients
-installed and signed in.
+The clone can live anywhere; the two links are what make each client see the skill. Start a new
+session afterwards.
+
+You need:
+
+- Python 3.9 or later. Nothing to `pip install`: the runner uses the standard library only.
+- Both the `claude` (Claude Code) and `codex` clients installed and signed in. A duet needs the
+  two of them, whichever one you start from.
+- macOS or Linux. It was developed and tested on macOS; Linux has not been tested, and Windows is
+  not supported outside WSL because the runner relies on POSIX file locks and process groups.
+
+To check the install without calling a model:
+
+```sh
+python3 ~/.agents/skills/duet/scripts/duet.py --help
+```
 
 Then, in Claude Code or Codex, ask for it: "run a duet with Codex to build X", or `/duet`.
 
