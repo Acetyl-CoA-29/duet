@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
-from . import authors, base, facts, gates, models, peers, phases, prompts, quality, snapshot, store
+from . import auth, authors, base, facts, gates, models, peers, phases, prompts, quality, snapshot, store
 from . import state as st
 from .base import (EXIT_BLIND, EXIT_CAP, EXIT_OK, EXIT_ORDER, EXIT_PEER_FAILED, EXIT_READONLY_BROKEN, EXIT_STALLED,
                    EXIT_USAGE, FINISHED_TEXT, emit, warn)
@@ -454,7 +454,7 @@ def _record(run: Path, args: argparse.Namespace, state: st.State, messages: List
 def _admit(run: Path, args: argparse.Namespace, state: st.State) -> Tuple[st.State, List[st.Message], Dict[str, Any]]:
     """Check the current gates and publish a pending turn before releasing the state lock."""
     messages = st.read_messages(run)
-    problem = peers.launch_problem(state["peer"])
+    problem = peers.launch_problem(state["peer"]) or auth.problem(state["peer"], auth.mode_of(state), os.environ)
     if problem:
         raise st.DuetError(problem)
     blocker = _peer_blocker(state, messages, args.phase, args.write, args.replan)
@@ -483,7 +483,7 @@ def _run(run: Path, args: argparse.Namespace) -> int:
             result = peers.run_turn(
                 state["peer"], ready["prompt"], ready["workspace"], ready["turn_dir"], ready["session"],
                 args.write, state["peer_model"], args.timeout, state.get("peer_effort"),
-                bool(state.get("peer_user_config")), store.hidden_from_peer(run),
+                bool(state.get("peer_user_config")), store.hidden_from_peer(run), auth.mode_of(state),
             )
             with base.transaction(run):
                 _verify_record(run)

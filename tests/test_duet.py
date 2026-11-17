@@ -806,7 +806,11 @@ def test_init_warns_when_api_key_may_override_plan_billing(env, capsys, monkeypa
     monkeypatch.setenv("OPENAI_API_KEY", "x")
     goal = write(env["tmp"], "goal.md", "x")
     assert cli.main(["init", "--workspace", str(env["ws"]), "--goal-file", goal, "--accept", "true"]) == 0
-    assert "may bill that API key" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "`codex exec` does not use it by itself" in err and "--peer-auth api-key" in err
+    monkeypatch.setenv("CODEX_API_KEY", "y")
+    assert cli.main(["init", "--workspace", str(env["ws"]), "--goal-file", goal, "--accept", "true"]) == 0
+    assert "will bill that API key instead of the subscription plan" in capsys.readouterr().err
 
 
 # --- run store location -------------------------------------------------------------------------

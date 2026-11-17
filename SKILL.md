@@ -1,7 +1,7 @@
 ---
 name: duet
 description: "Two top models, one conversation, one build: you (the host model) and a peer model from the other lab (Codex for a Claude host, Claude for a Codex host) frame a goal, write blind independent proposals, agree on a joint plan, then build, test and iterate together until an agreed acceptance command passes and the non-author approves. Use when asked to run a duet, to have Claude and Codex or GPT work or build together, to pair or debate with the other model, or for a two-model build loop. Not for a one-shot second opinion."
-version: 1.10.0
+version: 1.11.0
 ---
 
 # Duet
@@ -13,15 +13,19 @@ conversation. Never simulate the peer, and never present your own text as the pe
 The runner enforces the protocol; you supply the thinking. `D` below means
 `python3 <this skill's directory>/scripts/duet.py` (resolve it through symlinks).
 
-**Needs:** Python 3.9+, and the peer's client installed and signed in (`codex` when you are
-Claude, `claude` when you are Codex). `init` checks installation and known sandbox restrictions,
+**Needs:** Python 3.9+, and the peer's client installed (`codex` when you are Claude, `claude`
+when you are Codex), signed in to a plan or given an API key. `init` checks installation and known sandbox restrictions,
 not sign-in; an authentication failure appears on the first peer turn. If the client is missing,
 stop; for failed turns follow exit 5 below. Do not continue alone and call it a duet.
 
 ## Before starting
 
-1. Tell the user which two models are taking part, that peer turns use their Codex or Claude
-   plan, and that the peer will get write access to the workspace during build turns. If they
+1. Tell the user which two models are taking part, how peer turns are paid for, and that the
+   peer will get write access to the workspace during build turns. The peer's client signs in
+   with its plan or an API key: pass `--peer-auth plan` or `--peer-auth api-key` when the user
+   states a preference (an API key needs `ANTHROPIC_API_KEY`, or `CODEX_API_KEY`/`OPENAI_API_KEY`,
+   in the environment); otherwise `init` reports what the default will do, and `status` shows it
+   under `peer_sign_in`. Never ask for, print or write down a key. If they
    named a budget, pass it as `--max-turns` and, for a Claude peer, `--max-cost <dollars>`.
    The peer runs its client's configured default model unless you pass `--peer-model <name>`
    (and `--peer-effort`); pass the model the user named. Always pass `--host-model <your own

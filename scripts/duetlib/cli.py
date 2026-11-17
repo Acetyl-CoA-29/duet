@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from . import authors, base, facts, gates, models, operations, peers, phases, quality, store, turn
+from . import auth, authors, base, facts, gates, models, operations, peers, phases, quality, store, turn
 from . import state as st
 from .base import (EXIT_BLIND, EXIT_CAP, EXIT_CHECK_FAILED, EXIT_INTERNAL, EXIT_NOT_DONE,  # noqa: F401 - re-exported
                    EXIT_OK, EXIT_ORDER, EXIT_PEER_FAILED, EXIT_READONLY_BROKEN, EXIT_STALLED, EXIT_TAMPERED,
@@ -51,7 +51,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     if args.max_turns < 1:
         raise st.DuetError("--max-turns must be at least 1")
     _dollars(args.max_cost, "--max-cost")
-    problem = peers.launch_problem(args.peer)
+    problem = peers.launch_problem(args.peer) or auth.problem(args.peer, args.peer_auth, os.environ)
     if problem:
         raise st.DuetError(problem)
     for flag, value in (("--peer-model", args.peer_model), ("--host-model", args.host_model)):
@@ -63,16 +63,14 @@ def cmd_init(args: argparse.Namespace) -> int:
         args.peer_user_config, args.max_cost, args.skip_proposals,
         gates.fingerprint(Path(args.workspace)) if Path(args.workspace).is_dir() else None,
     )
-    start = {"host_model": args.host_model, "peer_model_configured": models.configured_for(args.peer),
+    start = {"peer_auth": args.peer_auth, "host_model": args.host_model, "peer_model_configured": models.configured_for(args.peer),
              quality.PROOF_KEY: ({"cmd": args.accept, "how": "accepted unproven by the user: " + args.accept_unproven}
                                  if args.accept and args.accept_unproven else None)}
     if Path(args.workspace).is_dir():
         start["facts_digest"] = facts.record_baseline(run, Path(args.workspace))
     base.update(run, lambda fresh: start)
-    own_key = {"codex": "OPENAI_API_KEY", "claude": "ANTHROPIC_API_KEY"}[args.peer]
-    if os.environ.get(own_key):
-        warn(f"{own_key} is set in this environment: the {args.peer} client may bill that API key "
-             "instead of the subscription plan")
+    for note in auth.init_notes(args.peer, args.peer_auth, os.environ):
+        warn(note)
     if st.load_state(run)["store"] == store.STORE_WORKSPACE:
         warn(store.FALLBACK_NOTICE.format(home=store.duet_home(), root=st.RUN_ROOT))
     emit(str(run))
@@ -311,6 +309,7 @@ def _report(run: Path) -> Dict[str, Any]:
         "allowed_next": [] if done else _allowed_next(state, messages, here),
         "with_replan": [] if done else phases.needs_replan(state, messages),
         "host": state["host"], "peer": state["peer"], "models": models.identities(state),
+        "peer_sign_in": auth.describe(state["peer"], auth.mode_of(state), os.environ),
         "peer_session": state["peer_session"], "peer_turns": state["peer_turns"],
         "max_turns": state["max_turns"], "messages": len(messages), "peer_turn": running,
         "pending_command": state.get("pending_command"),
@@ -410,6 +409,9 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--peer-model", help="override the peer client's own default model")
     init.add_argument("--accept-unproven", type=_nonempty, metavar="WORDS",
                       help="the user's decision, in their words, to use --accept without showing it can fail")
+    init.add_argument("--peer-auth", choices=auth.MODES, default=auth.AUTO,
+                      help="how the peer's client signs in: its plan, an API key from the environment, "
+                           "or whatever the client picks (default)")
     init.add_argument("--host-model", help="the host's own model name, recorded so reports name both models")
     init.add_argument("--peer-effort", help="Codex reasoning effort for this run; its own default if omitted")
     init.add_argument("--peer-user-config", action="store_true",

@@ -25,8 +25,9 @@ session afterwards.
 You need:
 
 - Python 3.9 or later. Nothing to `pip install`: the runner uses the standard library only.
-- Both the `claude` (Claude Code) and `codex` clients installed and signed in. A duet needs the
-  two of them, whichever one you start from.
+- Both the `claude` (Claude Code) and `codex` clients installed. A duet needs the two of them,
+  whichever one you start from. Each can be signed in to a subscription plan or use an API key;
+  see [Plans and API keys](#plans-and-api-keys).
 - macOS or Linux. It was developed and tested on macOS; Linux has not been tested, and Windows is
   not supported outside WSL because the runner relies on POSIX file locks and process groups.
 
@@ -37,6 +38,33 @@ python3 ~/.agents/skills/duet/scripts/duet.py --help
 ```
 
 Then, in Claude Code or Codex, ask for it: "run a duet with Codex to build X", or `/duet`.
+
+## Plans and API keys
+
+duet does not call either lab's API itself. It runs the peer through that lab's own client, and
+the client signs in however it is set up: with your account's subscription (the client's usual
+OAuth sign-in), or with an API key. You do not need a plan from either lab if you have keys.
+
+`--peer-auth` at `init` says which the peer should use:
+
+| `--peer-auth` | What happens |
+|---|---|
+| `plan` | The peer lab's key variables are withheld from the peer, so its client uses the account it is signed in to. Use this when a key is set in your shell but you want the plan to pay. |
+| `api-key` | The peer signs in with a key from your environment. `init` refuses if none is set. |
+| `auto` (default) | The environment is passed through and the client decides. `init` tells you what that will mean. |
+
+The keys are read from the usual variables:
+
+- **Claude peer:** `ANTHROPIC_API_KEY`. Claude Code uses it automatically in non-interactive
+  runs, ahead of a subscription login.
+- **Codex peer:** `CODEX_API_KEY` or `OPENAI_API_KEY`. `codex exec` only reads `CODEX_API_KEY`,
+  so with `--peer-auth api-key` duet passes your `OPENAI_API_KEY` to the peer under that name.
+
+The host is your own session, so it uses whatever you started it with: for example
+`ANTHROPIC_API_KEY=... claude`, or `codex login --with-api-key`.
+
+The runner never stores or prints a key. It only decides which variable names the peer's process
+receives, and `status` reports the choice under `peer_sign_in`.
 
 ## What a run looks like
 
@@ -200,7 +228,7 @@ Write message files into `<run>/drafts/`, not the workspace: the finish gate com
 files, and a stray message file there counts as a change.
 
 Options at `init`: `--peer claude` (when Codex hosts), `--peer-model`, `--host-model`,
-`--peer-effort` (Codex reasoning effort), `--peer-user-config` (load your own Claude settings
+`--peer-auth plan|api-key|auto`, `--peer-effort` (Codex reasoning effort), `--peer-user-config` (load your own Claude settings
 into a Claude peer), `--max-turns`, `--max-cost`, `--skip-proposals "<reason>"`,
 `--waive-accept "<reason>"`, `--accept-later`, `--accept-unproven "<your words>"`.
 
@@ -330,10 +358,9 @@ full contents.
 
 - **Everything in the conversation goes to the other lab's model**, along with any file the peer
   reads in the workspace. Keep secrets out of the goal and the workspace.
-- **Peer turns use your Codex or Claude plan** at that client's configured model and effort. A
-  long run at maximum effort is expensive. `--peer-effort`, `--max-turns` and `--max-cost` are
-  the controls. If an API key for the peer's lab is set in your shell, the client may bill that
-  key instead of the plan, and `init` warns about it.
+- **Peer turns are paid for by your plan or your API key** at that client's configured model
+  and effort. A long run at maximum effort is expensive. `--peer-effort`, `--max-turns` and
+  `--max-cost` are the controls, and `--peer-auth` decides who pays.
 - **There is no evidence yet that the pair beats one model working alone on the same budget.**
   `eval/` holds a harness for that comparison and a smaller benchmark that tests whether a
   reviewer from the other lab catches defects that a same-lab reviewer misses. Neither has

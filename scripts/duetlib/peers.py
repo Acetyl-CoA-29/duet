@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from . import models
+from . import auth, models
 from .gates import stop_group
 
 DEFAULT_TIMEOUT_SECONDS = 2400
@@ -50,7 +50,8 @@ def peer_binary(peer: str) -> str:
 def launch_problem(peer: str) -> Optional[str]:
     """Explain up front why the peer cannot be reached from here, if that is the case."""
     if shutil.which(peer_binary(peer)) is None:
-        return f"the `{peer_binary(peer)}` command-line client was not found; install it and sign in first"
+        return (f"the `{peer_binary(peer)}` command-line client was not found; install it, then sign in "
+                "or provide an API key (--peer-auth api-key)")
     if peer == "claude" and os.environ.get("CODEX_SANDBOX_NETWORK_DISABLED") == "1":
         return ("the Codex sandbox this command runs in has no network access, so the Claude client cannot "
                 "be reached. Start Codex with network access and a writable ~/.claude, for example: "
@@ -254,7 +255,7 @@ def _drop_empty_client_folder(workspace: Path) -> None:
             return
 
 
-def peer_env(peer: str) -> Dict[str, str]:
+def peer_env(peer: str, sign_in: str = auth.AUTO) -> Dict[str, str]:
     """The peer's environment without the other lab's credentials, common deploy secrets, or anything
     whose name ends like a secret. Kept: what the peer's own client signs in with (its lab's prefixes,
     AWS credentials for a Claude client on Bedrock) and whatever DUET_KEEP_ENV lists."""
@@ -270,7 +271,8 @@ def peer_env(peer: str) -> Dict[str, str]:
             return True
         return name.upper().endswith(SECRET_SUFFIXES) and not name.upper().startswith(OWN_PREFIXES[peer])
 
-    return {name: value for name, value in os.environ.items() if not dropped(name)}
+    kept = {name: value for name, value in os.environ.items() if not dropped(name)}
+    return auth.apply(peer, sign_in, kept)
 
 
 def run_turn(
@@ -285,6 +287,7 @@ def run_turn(
     effort: Optional[str] = None,
     user_config: bool = False,
     hidden: Optional[Path] = None,
+    sign_in: str = auth.AUTO,
 ) -> PeerResult:
     """Send one message to the peer and wait for its reply. The prompt travels on stdin only."""
     turn_dir.mkdir(parents=True, exist_ok=True)
@@ -299,7 +302,7 @@ def run_turn(
         with out_path.open("wb") as out, err_path.open("wb") as err:
             # Own process group, so a timeout stops the client and everything it started.
             child = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=out, stderr=err,
-                                     cwd=str(workspace), start_new_session=True, env=peer_env(peer))
+                                     cwd=str(workspace), start_new_session=True, env=peer_env(peer, sign_in))
             try:
                 child.communicate(prompt.encode("utf-8"), timeout=timeout)
                 code = child.returncode
